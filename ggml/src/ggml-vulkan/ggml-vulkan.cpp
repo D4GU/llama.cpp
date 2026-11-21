@@ -3683,6 +3683,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[0][1][i], "rms_norm_mul_f32" + suffix, RMS_SHADER(rms_norm_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[1][0][i], "rms_norm_bf16" + suffix, RMS_SHADER(rms_norm_bf16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm[1][1][i], "rms_norm_mul_bf16" + suffix, RMS_SHADER(rms_norm_bf16), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
+        // the same specialization as pipeline_rms_norm[0][0], so each row is reduced as by the unfused RMS_NORM
+        ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mix_f32[i], "rms_norm_mix_f32" + suffix, RMS_SHADER(rms_norm_mix_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size, rms_unroll}, 1, true, rms_subgroups);
         for (uint32_t pm : {0, 1}) {
             const std::string name = pm ? "rms_norm_mul_add_mul" : "rms_norm_mul_add";
             ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_add[0][0][pm][i], name + "_f32" + suffix, RMS_SHADER(rms_norm_mul_add_f32), "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, pm, block_size, rms_unroll}, 1, true, rms_subgroups);
@@ -12170,6 +12172,31 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_vk_rms_norm_finish(ctx, src0);
 }
 
+// node_idx is the CONCAT, the start of mix_norm_pattern. The rows are dispatched and reduced as by the
+// unfused RMS_NORM of the concat, and each normalized value is also written to the CONT of its transpose
+static void ggml_vk_mix_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    ggml_tensor *       rms    = cgraph->nodes[node_idx + 1];
+    ggml_tensor *       cont   = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * stack  = concat->src[0];
+    const ggml_tensor * cur    = concat->src[1];
+
+    vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(stack, cur, rms, ggml_get_op_params_f32(rms, 0), 0);
+    init_pushconst_tensor_offsets(ctx, pc, stack, cur, nullptr, nullptr, rms);
+    pc.param3 = get_misalign_bytes(ctx, cont) / ggml_type_size(cont->type);
+
+    vk_pipeline pipeline = ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm_mix_f32, rms->ne[0]);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, stack, true), ggml_vk_tensor_subbuffer(ctx, cur, true),
+        ggml_vk_tensor_subbuffer(ctx, rms, true), ggml_vk_tensor_subbuffer(ctx, cont, true),
+    }, pc, {
+        (uint32_t)rms->ne[1],
+        std::min((uint32_t)rms->ne[2], ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+        std::min((uint32_t)rms->ne[3], ctx->device->properties.limits.maxComputeWorkGroupCount[2]),
+    });
+}
+
 void ggml_vk_rms_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], 0.0f, 0.0f, 0.0f });
@@ -13719,7 +13746,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
-        ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        if (ctx->fused_mix_norm) {
+            ggml_vk_mix_norm(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
+        }
 
         break;
     case GGML_OP_UPSCALE:
@@ -15655,6 +15686,36 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
     return false;
 }
 
+static bool ggml_vk_can_fuse_mix_norm(const struct ggml_cgraph * cgraph, int node_idx) {
+    // the RMS_NORM and the CONT are both read later
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, mix_norm_pattern, { node_idx + 1, node_idx + 3 }) ||
+        !ggml_check_edges(cgraph, node_idx, mix_norm_edges)) {
+        return false;
+    }
+
+    const ggml_tensor * concat = cgraph->nodes[node_idx];
+    const ggml_tensor * rms    = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * trans  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * cont   = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * stack  = concat->src[0];
+    const ggml_tensor * cur    = concat->src[1];
+
+    if (ggml_get_op_params_i32(concat, 0) != 1 || cur->ne[1] != 1) {
+        return false;
+    }
+    if (stack->type != GGML_TYPE_F32 || cur->type != GGML_TYPE_F32 || concat->type != GGML_TYPE_F32 ||
+        rms->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the shader reads whole rows of stack and cur, and writes rms and cont densely
+    if (stack->nb[0] != sizeof(float) || cur->nb[0] != sizeof(float) ||
+        !ggml_is_contiguous(rms) || !ggml_is_contiguous(cont) || !ggml_are_same_shape(trans, cont)) {
+        return false;
+    }
+    // the shader writes both outputs in one pass
+    return !ggml_vk_tensors_overlap(rms, cont, false);
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -15923,6 +15984,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_situ = false;
         ctx->fused_loop_ctrl = false;
         ctx->fused_ssm_conv_res = false;
+        ctx->fused_mix_norm = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -16021,6 +16083,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mix_norm(cgraph, i)) {
+                ctx->num_additional_fused_ops = mix_norm_pattern.size() - 1;
+                // the RMS_NORM is an output too
+                ctx->fused_ops_write_mask |= 1 << 1;
+                ctx->fused_mix_norm = true;
+                fusion_string = "MIX_NORM";
+                // the transposed write crosses rows, and the cur row lands at another row index
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_ssm_conv_res(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = ssm_conv_res_pattern.size() - 1;
                 ctx->fused_ssm_conv_res = true;
@@ -16199,6 +16269,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_situ = false;
                 ctx->fused_loop_ctrl = false;
                 ctx->fused_ssm_conv_res = false;
+                ctx->fused_mix_norm = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -16471,6 +16542,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(ssm_conv_res_pattern)) {
             continue;
         }
+        if (match_pattern(mix_norm_pattern, first_unused)) {
+            // the fused op writes both outputs while it still reads the stack and cur
+            add_pattern_alloc_deps(mix_norm_pattern, first_unused + (int) mix_norm_pattern.size() - 1);
+            keep_pattern(mix_norm_pattern);
+            continue;
+        }
         if (keep_pattern(topk_qsa_pattern)) {
             continue;
         }
@@ -16526,6 +16603,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 in_pattern(topk_qsa_pattern, j) ||
                 in_pattern(loop_ctrl_pattern, j) ||
                 match_pattern(ssm_conv_res_pattern, j) ||
+                match_pattern(mix_norm_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||

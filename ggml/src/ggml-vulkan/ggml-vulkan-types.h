@@ -630,6 +630,16 @@ static constexpr std::initializer_list<std::array<int, 3>> ssm_conv_res_edges {
     { 3, 0, 2 }, // scale->src[0]   == add
 };
 
+// the depth states of Inkling 2 mix(): rms_norm(concat(stack, cur, 1)) and its transposed copy
+static constexpr std::initializer_list<ggml_op> mix_norm_pattern { GGML_OP_CONCAT, GGML_OP_RMS_NORM, GGML_OP_TRANSPOSE, GGML_OP_CONT };
+
+// relative to the CONCAT node
+static constexpr std::initializer_list<std::array<int, 3>> mix_norm_edges {
+    { 1, 0, 0 }, // rms_norm->src[0]  == concat
+    { 2, 0, 1 }, // transpose->src[0] == rms_norm
+    { 3, 0, 2 }, // cont->src[0]      == transpose
+};
+
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
@@ -1002,6 +1012,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f16;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_mix_f32;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
     vk_pipeline pipeline_l2_clip_f32[2]; // [with leading MUL]
@@ -1443,6 +1454,7 @@ struct ggml_backend_vk_context {
     bool fused_situ {};
     bool fused_loop_ctrl {};
     bool fused_ssm_conv_res {};
+    bool fused_mix_norm {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
