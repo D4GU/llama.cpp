@@ -16517,6 +16517,20 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return true;
     };
+
+    // whether UNARY node j has a MUL within reach that it can fuse with, but whose other src is not scheduled yet
+    auto const &unary_mul_waits = [&](int j) -> bool {
+        for (int k = j + 1; k < std::min(j + 15, graph->n_nodes); ++k) {
+            ggml_tensor * mul = graph->nodes[k];
+            if (mul->op != GGML_OP_MUL || (mul->src[0] != graph->nodes[j] && mul->src[1] != graph->nodes[j])) {
+                continue;
+            }
+            ggml_tensor * other = (mul->src[0] == graph->nodes[j]) ? mul->src[1] : mul->src[0];
+            return other->op != GGML_OP_NONE && used_node_set.find(other) == used_node_set.end() &&
+                   ggml_vk_can_fuse_unary_mul(graph, j, k);
+        }
+        return false;
+    };
     while (first_unused < graph->n_nodes) {
         std::vector<int> current_set;
 
@@ -16698,6 +16712,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j)) {
+                continue;
+            }
+            // pulled ahead alone, the unary would end up apart from its MUL and the two could not fuse
+            if (graph->nodes[j]->op == GGML_OP_UNARY && unary_mul_waits(j)) {
                 continue;
             }
             bool ok = true;
