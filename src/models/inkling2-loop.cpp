@@ -126,9 +126,10 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
             }
-            // the [n_embd, LOOP_CTRL_COUNT, n_tokens] of this layer
+            // the [n_embd, n_tokens, LOOP_CTRL_COUNT] of this layer
             auto layer_view = [&](ggml_tensor * t) {
-                return ggml_view_3d(ctx0, t, n_embd, LOOP_CTRL_COUNT, n_tokens, t->nb[1], t->nb[2], (ip - start)*t->nb[3]);
+                const size_t row = ggml_row_size(t->type, n_embd);
+                return ggml_view_3d(ctx0, t, n_embd, n_tokens, LOOP_CTRL_COUNT, row, n_tokens*row, (ip - start)*LOOP_CTRL_COUNT*n_tokens*row);
             };
             cur = build_layer(il, ip, cur, blocks, layer_view(messages), layer_view(message_norms), &m.loop_layers[ip - start]);
         }

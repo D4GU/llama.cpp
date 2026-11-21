@@ -256,7 +256,8 @@ ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
-// query is [n_embd, n_query, 1, n_set], the result [n_embd, n_query, n_tokens, n_set]
+// query is [n_embd, n_query, 1, n_set]. The result holds the n_tokens rows of each query back to back, one set after
+// another: [n_embd, n_tokens, n_query, n_set], which for one token is the memory of [n_embd, n_query, 1, n_set]
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     ggml_tensor *& out = mixes[{blocks, cur, query}];
     if (out) {
@@ -276,20 +277,26 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     const int64_t n_query = query->ne[1];
     const int64_t n_set   = query->ne[3];
 
-    // a single token needs no copy of the query per token. It runs several sets as a batch of single queries:
-    // a mat-vec computes each column of several queries as it computes a single one
-    ggml_tensor * queries = query;
-    if (n_tokens > 1) {
-        queries = ggml_repeat(ctx0, query, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd, n_query, n_tokens, n_set));
-    } else if (n_set > 1) {
-        queries = ggml_reshape_3d(ctx0, query, n_embd, 1, n_query*n_set);
+    // a mat-vec computes each column of several queries as it computes a single one, and each row of the states as
+    // it computes a batch of them. So a single token runs several sets as a batch of single queries, and a single
+    // query scores the states of all tokens as one matrix. Only several queries over several tokens copy the queries
+    ggml_tensor * scores;
+    if (n_tokens == 1) {
+        scores = ggml_mul_mat(ctx0, states, n_set > 1 ? ggml_reshape_3d(ctx0, query, n_embd, 1, n_query*n_set) : query);
+    } else if (n_query*n_set == 1) {
+        scores = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, states, n_embd, states->ne[1]*n_tokens), query);
+        scores = ggml_reshape_3d(ctx0, scores, states->ne[1], 1, n_tokens);
+    } else {
+        scores = ggml_mul_mat(ctx0, states, ggml_repeat(ctx0, query, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd, n_query, n_tokens, n_set)));
     }
-
-    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
     out = ggml_mul_mat(ctx0, states_t, scores);
-    return out = n_set > 1 ? ggml_reshape_4d(ctx0, out, n_embd, n_query, n_tokens, n_set) : out;
+    if (n_tokens == 1) {
+        return out = n_set > 1 ? ggml_reshape_4d(ctx0, out, n_embd, n_query, n_tokens, n_set) : out;
+    }
+    // one copy here instead of one for each query that a caller reads
+    return out = n_query*n_set > 1 ? ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)) : out;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -398,7 +405,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, or its norm, [n_embd, n_tokens]
     auto message = [&](ggml_tensor * t, int ctrl) {
-        return contiguous(ctx0, ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], ctrl*t->nb[1]));
+        return ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[1], ctrl*t->nb[2]);
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -411,9 +418,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
+        const size_t  row   = ggml_row_size(mixed->type, n_embd);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = is_swa && j > 0 ? inputs[0]
-                : contiguous(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]));
+            inputs[j] = is_swa && j > 0 ? inputs[0] : ggml_view_2d(ctx0, mixed, n_embd, n_tokens, row, j*n_tokens*row);
         }
     }
 
