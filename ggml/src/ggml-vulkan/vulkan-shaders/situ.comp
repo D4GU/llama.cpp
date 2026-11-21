@@ -1,0 +1,47 @@
+#version 450
+
+#include "utils.glsl"
+
+// Fused SITU MoE activation: d = (tanh(g*gs + gb)*gos + gob) * sigmoid(g) * (tanh(u*us + ub)*uos + uob)
+//   g and u are strided views with the same strides, d is contiguous
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer G {float data_g[];};
+layout (binding = 1) readonly  buffer U {float data_u[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint ne0, ne1, ne2;
+    uint nb1, nb2, nb3;
+    uint g_offset, u_offset, d_offset;
+    float g_scale, g_bias, g_out_scale, g_out_bias;
+    float u_scale, u_bias, u_out_scale, u_out_bias;
+} p;
+
+// as in unary.comp, so the result matches the unfused ops
+float op_tanh(float x) {
+    return 1.0f - 2.0f / (exp(2.0f*x) + 1.0f);
+}
+
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    uint i0, i1, i2, i3;
+    get_indices(idx, i0, i1, i2, i3, p.ne0, p.ne1, p.ne2, 0);
+    const uint src = i3*p.nb3 + i2*p.nb2 + i1*p.nb1 + i0;
+
+    const float g = data_g[p.g_offset + src];
+    const float u = data_u[p.u_offset + src];
+
+    const float act = (op_tanh(g * p.g_scale + p.g_bias) * p.g_out_scale + p.g_out_bias) * op_sigmoid(g);
+    const float up  = op_tanh(u * p.u_scale + p.u_bias) * p.u_out_scale + p.u_out_bias;
+    data_d[p.d_offset + idx] = act * up;
+}

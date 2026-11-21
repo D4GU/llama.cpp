@@ -584,6 +584,30 @@ static constexpr std::initializer_list<std::array<int, 3>> l2_clip_edges {
     { 7, 1, 6 }, // mul->src[1]      == clamp
 };
 
+// SITU MoE activation (beta*tanh(g/beta)*sigmoid(g)) * (lb*tanh(u/lb)),
+// where g and u are strided views of one gate_up tensor made contiguous
+static constexpr std::initializer_list<ggml_op> situ_pattern { GGML_OP_VIEW,  GGML_OP_CONT,  GGML_OP_SCALE, GGML_OP_UNARY,
+                                                               GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                                               GGML_OP_VIEW,  GGML_OP_CONT,  GGML_OP_SCALE, GGML_OP_UNARY,
+                                                               GGML_OP_SCALE, GGML_OP_MUL };
+
+// relative to the gate VIEW node
+static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
+    {  1, 0,  0 }, // cont->src[0]    == gate view
+    {  2, 0,  1 }, // scale->src[0]   == cont
+    {  3, 0,  2 }, // tanh->src[0]    == scale
+    {  4, 0,  3 }, // scale->src[0]   == tanh
+    {  5, 0,  1 }, // sigmoid->src[0] == cont
+    {  6, 0,  4 }, // mul->src[0]     == scale
+    {  6, 1,  5 }, // mul->src[1]     == sigmoid
+    {  8, 0,  7 }, // cont->src[0]    == up view
+    {  9, 0,  8 }, // scale->src[0]   == cont
+    { 10, 0,  9 }, // tanh->src[0]    == scale
+    { 11, 0, 10 }, // scale->src[0]   == tanh
+    { 12, 0,  6 }, // mul->src[0]     == gate mul
+    { 12, 1, 11 }, // mul->src[1]     == up scale
+};
+
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
@@ -959,6 +983,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
     vk_pipeline pipeline_l2_clip_f32[2]; // [with leading MUL]
+    vk_pipeline pipeline_situ_f32;
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_unary[GGML_UNARY_OP_COUNT][3];
@@ -1391,6 +1416,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_l2_clip {};
+    bool fused_situ {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

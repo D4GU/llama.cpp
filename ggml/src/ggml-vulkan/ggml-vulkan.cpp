@@ -3692,6 +3692,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // block size as in sum_rows, so the fused sum adds in the same order
     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32[0], "l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 3, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 0 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32[1], "mul_l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 3, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 1 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_32, "cpy_32", cpy_32_len, cpy_32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -13092,6 +13093,38 @@ static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context& subctx, g
     }, pc, elements);
 }
 
+// node_idx is the gate CONT, situ_pattern starts at the gate VIEW before it
+static void ggml_vk_situ(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const int start = node_idx - 1;
+    const ggml_tensor * gate       = cgraph->nodes[start];
+    const ggml_tensor * gate_scale = cgraph->nodes[start + 2];
+    const ggml_tensor * gate_out   = cgraph->nodes[start + 4];
+    const ggml_tensor * up         = cgraph->nodes[start + 7];
+    const ggml_tensor * up_scale   = cgraph->nodes[start + 9];
+    const ggml_tensor * up_out     = cgraph->nodes[start + 11];
+    ggml_tensor *       dst        = cgraph->nodes[start + 12];
+
+    vk_pipeline pipeline = ctx->device->pipeline_situ_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t ne = (uint32_t)ggml_nelements(dst);
+    const vk_op_situ_push_constants pc = {
+        ne,
+        (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2],
+        ggml_vk_nb_elem(gate, 1), ggml_vk_nb_elem(gate, 2), ggml_vk_nb_elem(gate, 3),
+        get_misalign_bytes(ctx, gate) / (uint32_t)sizeof(float), get_misalign_bytes(ctx, up) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(float),
+        ggml_get_op_params_f32(gate_scale, 0), ggml_get_op_params_f32(gate_scale, 1),
+        ggml_get_op_params_f32(gate_out, 0),   ggml_get_op_params_f32(gate_out, 1),
+        ggml_get_op_params_f32(up_scale, 0),   ggml_get_op_params_f32(up_scale, 1),
+        ggml_get_op_params_f32(up_out, 0),     ggml_get_op_params_f32(up_out, 1),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, gate, true), ggml_vk_tensor_subbuffer(ctx, up, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
+    }, pc, ggml_vk_nrows_elements(ne));
+}
+
 void ggml_vk_pool_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t op = static_cast<uint32_t>(dst->op_params[0]);
     const int32_t k0 = dst->op_params[1];
@@ -13679,7 +13712,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
-        ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        if (ctx->fused_situ) {
+            ggml_vk_situ(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SET_ROWS:
@@ -15386,6 +15423,64 @@ static bool ggml_vk_can_fuse_l2_clip(const struct ggml_cgraph * cgraph, int node
     return true;
 }
 
+// node_idx is the gate CONT, situ_pattern starts at the gate VIEW before it
+static bool ggml_vk_can_fuse_situ(const struct ggml_cgraph * cgraph, int node_idx) {
+    const int start = node_idx - 1;
+    const int n     = (int)situ_pattern.size();
+    if (start < 0 || start + n > cgraph->n_nodes) {
+        return false;
+    }
+
+    // the views compute nothing, so only the other nodes have to be elidable
+    std::array<int,     situ_pattern.size()> idxs;
+    std::array<ggml_op, situ_pattern.size()> ops;
+    int count = 0;
+    for (int k = 0; k < n; ++k) {
+        const ggml_op op = situ_pattern.begin()[k];
+        if (cgraph->nodes[start + k]->op != op) {
+            return false;
+        }
+        if (op != GGML_OP_VIEW) {
+            idxs[count] = start + k;
+            ops[count]  = op;
+            count++;
+        }
+    }
+    const int out_idx = start + n - 1;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), count, ops.data(), &out_idx, 1) ||
+        !ggml_check_edges(cgraph, start, situ_edges)) {
+        return false;
+    }
+
+    if (ggml_get_unary_op(cgraph->nodes[start + 3])  != GGML_UNARY_OP_TANH ||
+        ggml_get_unary_op(cgraph->nodes[start + 5])  != GGML_UNARY_OP_SIGMOID ||
+        ggml_get_unary_op(cgraph->nodes[start + 10]) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    for (int k = start; k <= out_idx; ++k) {
+        if (cgraph->nodes[k]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * gate = cgraph->nodes[start];
+    const ggml_tensor * up   = cgraph->nodes[start + 7];
+    const ggml_tensor * out  = cgraph->nodes[out_idx];
+    if (!ggml_are_same_shape(gate, out) || !ggml_are_same_shape(up, out) || !ggml_is_contiguous(out)) {
+        return false;
+    }
+    // the shader indexes both views with the gate strides, in floats
+    if (!ggml_are_same_stride(gate, up) || gate->nb[0] != sizeof(float)) {
+        return false;
+    }
+    for (int k = 1; k < GGML_MAX_DIMS; ++k) {
+        if (gate->nb[k] % sizeof(float) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
     ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
     vk_buffer a_buf = a_buf_ctx->dev_buffer;
@@ -15674,6 +15769,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_l2_clip = false;
+        ctx->fused_situ = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -15809,6 +15905,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // like rms_norm_mul: one workgroup reads a whole row and reduces it before
                 // any thread writes, and each thread writes only the elements it read
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_situ(cgraph, i)) {
+                // from the gate CONT through the up VIEW to the output MUL
+                ctx->num_additional_fused_ops = situ_pattern.size() - 2;
+                ctx->fused_situ = true;
+                fusion_string = "SITU";
+                // the views are read at their own strides, not where the output is written
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = topk_qsa_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
@@ -15925,6 +16028,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_l2_clip = false;
+                ctx->fused_situ = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -16108,6 +16212,16 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // whether node n is any node of an unscheduled instance of pattern
+        auto const &in_pattern = [&](const std::initializer_list<ggml_op> &pattern, int n) -> bool {
+            for (int o = 0; o < (int) pattern.size(); ++o) {
+                if (n - o >= 0 && match_pattern(pattern, n - o)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -16175,6 +16289,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(mul_l2_clip_pattern) || keep_pattern(l2_clip_pattern)) {
             continue;
         }
+        if (match_pattern(situ_pattern, first_unused)) {
+            // the fused op reads gate_up at the output node, after the up CONT that frees it unfused
+            add_pattern_alloc_deps(situ_pattern, first_unused + (int) situ_pattern.size() - 1);
+            keep_pattern(situ_pattern);
+            continue;
+        }
         if (keep_pattern(topk_qsa_pattern)) {
             continue;
         }
@@ -16219,14 +16339,6 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             // Protect every interior QSA node (not just the start): the mask branch is
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
-            auto const &in_qsa_pattern = [&](int n) -> bool {
-                for (int o = 0; o < (int) topk_qsa_pattern.size(); ++o) {
-                    if (n - o >= 0 && match_pattern(topk_qsa_pattern, n - o)) {
-                        return true;
-                    }
-                }
-                return false;
-            };
             if (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
@@ -16235,7 +16347,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(snake_pattern, j) ||
                 match_pattern(mul_l2_clip_pattern, j) ||
                 match_pattern(l2_clip_pattern, j) ||
-                in_qsa_pattern(j) ||
+                in_pattern(topk_qsa_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
@@ -16393,6 +16505,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     continue;
                 }
                 if (!is_empty(graph->nodes[j])) {
+                    continue;
+                }
+                // keep_pattern needs both SITU views in place. The first pass never moves SITU nodes:
+                // it skips views, and every other SITU node depends on one of them
+                if (in_pattern(situ_pattern, j)) {
                     continue;
                 }
                 bool ok = true;
