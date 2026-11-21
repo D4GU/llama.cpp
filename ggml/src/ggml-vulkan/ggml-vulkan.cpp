@@ -17462,6 +17462,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (const ggml_tensor * x = ggml_vk_conv_state_concat(graph, i)) {
             const int last = i + 3 + ggml_can_fuse_subgraph(graph, i, ssm_conv_res_skip_pattern, { i + 4 });
             params->add_alloc_dep(params->user_data, x->src[0], graph->nodes[last]);
+            // over several tokens the fused op reads cur across tokens, so its output must not take cur's place.
+            // One token reads only its own element, and those graphs keep their allocation
+            if (graph->nodes[i]->ne[1] > 1) {
+                ggml_tensor * add = graph->nodes[i + 2];
+                params->add_alloc_dep(params->user_data, add->src[0] == graph->nodes[i + 1] ? add->src[1] : add->src[0], graph->nodes[last]);
+            }
             ggml_set_op_params_i32(graph->nodes[i], 0, 1);
         } else if (const ggml_tensor * x = ggml_vk_conv_dynamic_concat(graph, i, chain)) {
             for (ggml_tensor * t : { x->src[0], chain.cur, chain.taps }) {
