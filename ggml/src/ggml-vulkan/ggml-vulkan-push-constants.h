@@ -727,6 +727,9 @@ struct vk_op_l2_clip_push_constants {
     float scale, bias;
     float threshold;
     float clamp_min, clamp_max;
+    // the row multiplier, in the row_mul variant only
+    uint32_t ne21, ne22, ne23;
+    uint32_t t_offset;
 };
 
 struct vk_op_situ_push_constants {
@@ -1106,8 +1109,8 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     p.b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+    p.t_offset = src2 ? get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type) : 0;
 
-    GGML_UNUSED(src2);
     GGML_UNUSED(src3);
 }
 

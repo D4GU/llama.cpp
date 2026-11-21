@@ -4,11 +4,15 @@
 
 // Fused per-row L2 norm clip: y = x * clamp(threshold / (sqrt(sum(x*x)) * scale + bias), clamp_min, clamp_max)
 //   x = data_a, or data_a * data_b with do_multiply, where data_b broadcasts whole rows
+// With L2_CLIP_ROW_MUL, y is then multiplied by one value of data_t per row, broadcast as the MUL does
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly  buffer A {float data_a[];};
 layout (binding = 1) readonly  buffer B {float data_b[];};
 layout (binding = 2) writeonly buffer D {float data_d[];};
+#if defined(L2_CLIP_ROW_MUL)
+layout (binding = 3) readonly  buffer T {float data_t[];};
+#endif
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const bool do_multiply = false;
@@ -22,9 +26,22 @@ layout (push_constant) uniform parameter {
     float scale, bias;
     float threshold;
     float clamp_min, clamp_max;
+#if defined(L2_CLIP_ROW_MUL)
+    uint ne21, ne22, ne23;
+    uint t_offset;
+#endif
 } p;
 
 shared float tmp[BLOCK_SIZE];
+
+#if defined(L2_CLIP_ROW_MUL)
+// y is rounded before the multiply, as the separate MUL reads it from memory. precise sits in its own function
+// so it does not reach back into the clip factor, which then compiles as in the variants without the MUL
+float row_mul(float y, float t) {
+    precise float r = y * t;
+    return r;
+}
+#endif
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
@@ -58,9 +75,16 @@ void main() {
     }
 
     const float factor = clamp(p.threshold / (sqrt(tmp[0]) * p.scale + p.bias), p.clamp_min, p.clamp_max);
+#if defined(L2_CLIP_ROW_MUL)
+    const float t = data_t[p.t_offset + ((i03 % p.ne23) * p.ne22 + i02 % p.ne22) * p.ne21 + i01 % p.ne21];
+#endif
 
     for (uint i = col; i < p.ncols; i += BLOCK_SIZE) {
         const float x = do_multiply ? data_a[a_base + i] * data_b[b_base + i] : data_a[a_base + i];
+#if defined(L2_CLIP_ROW_MUL)
+        data_d[d_base + i] = row_mul(x * factor, t);
+#else
         data_d[d_base + i] = x * factor;
+#endif
     }
 }

@@ -3714,6 +3714,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // block size as in sum_rows, so the fused sum adds in the same order
     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32[0], "l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 3, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 0 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32[1], "mul_l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 3, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 1 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_l2_clip_row_mul_f32, "mul_l2_clip_row_mul_f32", l2_clip_row_mul_f32_len, l2_clip_row_mul_f32_data, "main", 4, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 1 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_loop_ctrl_f32, "loop_ctrl_f32", loop_ctrl_f32_len, loop_ctrl_f32_data, "main", 6, sizeof(vk_op_loop_ctrl_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_attn_rel_bias, "attn_rel_bias", attn_rel_bias_len, attn_rel_bias_data, "main", 5, sizeof(vk_op_attn_rel_bias_push_constants), {512, 1, 1}, {}, 1);
@@ -13135,17 +13136,19 @@ void ggml_vk_snake_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& sub
 
 static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
     const bool with_mul = cgraph->nodes[node_idx]->op == GGML_OP_MUL;
+    const bool row_mul  = ctx->num_additional_fused_ops == (int) mul_l2_clip_row_mul_pattern.size() - 1;
     const ggml_tensor * sqr    = cgraph->nodes[node_idx + with_mul];
     const ggml_tensor * norm   = cgraph->nodes[node_idx + with_mul + 3];
     const ggml_tensor * fill   = cgraph->nodes[node_idx + with_mul + 4];
     const ggml_tensor * factor = cgraph->nodes[node_idx + with_mul + 6];
-    ggml_tensor *       dst    = cgraph->nodes[node_idx + with_mul + 7];
+    ggml_tensor *       dst    = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
 
     const ggml_tensor * x = with_mul ? sqr->src[0]->src[0] : sqr->src[0];
     // without the MUL the shader never reads w, x only fills its binding
     const ggml_tensor * w = with_mul ? sqr->src[0]->src[1] : x;
+    const ggml_tensor * t = row_mul ? dst->src[1] : nullptr;
 
-    vk_pipeline pipeline = ctx->device->pipeline_l2_clip_f32[with_mul];
+    vk_pipeline pipeline = row_mul ? ctx->device->pipeline_mul_l2_clip_row_mul_f32 : ctx->device->pipeline_l2_clip_f32[with_mul];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const uint32_t nrows = (uint32_t)ggml_nrows(x);
@@ -13157,8 +13160,10 @@ static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context& subctx, g
         ggml_get_op_params_f32(norm, 0), ggml_get_op_params_f32(norm, 1),
         ggml_get_op_params_f32(fill, 0),
         ggml_get_op_params_f32(factor, 0), ggml_get_op_params_f32(factor, 1),
+        t ? (uint32_t)t->ne[1] : 0, t ? (uint32_t)t->ne[2] : 0, t ? (uint32_t)t->ne[3] : 0,
+        0,
     };
-    init_pushconst_tensor_offsets(ctx, pc, x, w, nullptr, nullptr, dst);
+    init_pushconst_tensor_offsets(ctx, pc, x, w, t, nullptr, dst);
 
     // one workgroup per row, laid out as for sum_rows
     std::array<uint32_t, 3> elements;
@@ -13170,9 +13175,16 @@ static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context& subctx, g
         elements = { nrows, 1, 1 };
     }
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
-        ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
-    }, pc, elements);
+    if (row_mul) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+            ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
+            ggml_vk_tensor_subbuffer(ctx, t, true),
+        }, pc, elements);
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+            ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
+        }, pc, elements);
+    }
 }
 
 // node_idx is the gate CONT, situ_pattern starts at the gate VIEW before it
@@ -15548,9 +15560,11 @@ bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgr
 }
 
 // with_mul: x = MUL(cur, w) starts the chain and the fused op reads cur and w instead of x
-static bool ggml_vk_can_fuse_l2_clip(const struct ggml_cgraph * cgraph, int node_idx, bool with_mul) {
+// row_mul (with with_mul only): a MUL of the clipped rows by one value per row ends the chain
+static bool ggml_vk_can_fuse_l2_clip(const struct ggml_cgraph * cgraph, int node_idx, bool with_mul, bool row_mul) {
     const int sqr_idx = node_idx + with_mul;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, with_mul ? mul_l2_clip_pattern : l2_clip_pattern, { sqr_idx + 7 }) ||
+    const auto & pattern = row_mul ? mul_l2_clip_row_mul_pattern : with_mul ? mul_l2_clip_pattern : l2_clip_pattern;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, pattern, { sqr_idx + 7 + row_mul }) ||
         !ggml_check_edges(cgraph, sqr_idx, l2_clip_edges)) {
         return false;
     }
@@ -15575,6 +15589,15 @@ static bool ggml_vk_can_fuse_l2_clip(const struct ggml_cgraph * cgraph, int node
     // the shader reads w one whole row at a time
     if (w && (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != cur->ne[0] || !ggml_can_repeat(w, cur))) {
         return false;
+    }
+    if (row_mul) {
+        const ggml_tensor * tail = cgraph->nodes[sqr_idx + 8];
+        const ggml_tensor * t    = tail->src[1];
+        // the shader reads one value of t per row, at the row's broadcast index
+        if (tail->src[0] != out || t->type != GGML_TYPE_F32 || tail->type != GGML_TYPE_F32 || t->ne[0] != 1 ||
+            !ggml_is_contiguous(t) || !ggml_can_repeat(t, out) || !ggml_are_same_shape(tail, out) || !ggml_is_contiguous(tail)) {
+            return false;
+        }
     }
     return true;
 }
@@ -16222,11 +16245,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
-            } else if (ggml_vk_can_fuse_l2_clip(cgraph, i, true) || ggml_vk_can_fuse_l2_clip(cgraph, i, false)) {
+            } else if (ggml_vk_can_fuse_l2_clip(cgraph, i, true, true) || ggml_vk_can_fuse_l2_clip(cgraph, i, true, false) ||
+                       ggml_vk_can_fuse_l2_clip(cgraph, i, false, false)) {
                 const bool with_mul = cgraph->nodes[i]->op == GGML_OP_MUL;
-                ctx->num_additional_fused_ops = (with_mul ? mul_l2_clip_pattern : l2_clip_pattern).size() - 1;
+                const bool row_mul  = ggml_vk_can_fuse_l2_clip(cgraph, i, true, true);
+                ctx->num_additional_fused_ops = (row_mul ? mul_l2_clip_row_mul_pattern : with_mul ? mul_l2_clip_pattern : l2_clip_pattern).size() - 1;
                 ctx->fused_l2_clip = true;
-                fusion_string = with_mul ? "MUL_L2_CLIP" : "L2_CLIP";
+                fusion_string = row_mul ? "MUL_L2_CLIP_ROW_MUL" : with_mul ? "MUL_L2_CLIP" : "L2_CLIP";
                 // like rms_norm_mul: one workgroup reads a whole row and reduces it before
                 // any thread writes, and each thread writes only the elements it read
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
