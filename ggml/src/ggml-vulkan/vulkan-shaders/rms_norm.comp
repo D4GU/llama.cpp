@@ -48,6 +48,18 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 
+#elif RMS_NORM_MIX_FUSION
+
+// the depth states of Inkling 2 mix(): concat(stack, cur) along dim 1, normalized, plus a transposed copy.
+// A holds the stack rows, B the cur row that comes last, T receives the transpose at offset p.param3
+layout (binding = 3) writeonly buffer T {D_TYPE data_t[];};
+
+#endif
+
+#if RMS_NORM_MIX_FUSION
+#define LOAD_A(i) (from_cur ? data_b[i] : data_a[i])
+#else
+#define LOAD_A(i) data_a[i]
 #endif
 
 layout (constant_id = 1) const bool do_multiply = false;
@@ -77,6 +89,13 @@ void rms_norm(uint num_iters) {
 
             uint32_t a_offset = samp*stride_sample + channel*stride_channel + row*stride_row + get_aoffset();
             uint32_t b_offset = src1_idx(0, row, channel, samp) + get_boffset();
+#if RMS_NORM_MIX_FUSION
+            const bool from_cur = row == nrows - 1;
+            if (from_cur) {
+                a_offset = samp*p.nb13 + channel*p.nb12 + get_boffset();
+            }
+            const uint32_t t_offset = (samp*nchannels + channel)*ncols*nrows + row + uint32_t(p.param3);
+#endif
 #if RMS_NORM_ROPE_FUSION
             // Per-row offset in shared memory
             uint32_t d_offset = 0;
@@ -96,7 +115,7 @@ void rms_norm(uint num_iters) {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 FLOAT_TYPE xi = FLOAT_TYPE(0);
                 if (col < ncols) {
-                    xi = FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col]));
+                    xi = FLOAT_TYPE(A_TO_FLOAT(LOAD_A(a_offset + col)));
                 }
                 sum += xi * xi;
             }
@@ -182,7 +201,13 @@ void rms_norm(uint num_iters) {
                     if (col >= ncols) {
                         continue;
                     }
+#if RMS_NORM_MIX_FUSION
+                    const D_TYPE value = FLOAT_TO_D(scale * FLOAT_TYPE(A_TO_FLOAT(LOAD_A(a_offset + col))));
+                    data_d[d_offset + col] = value;
+                    data_t[t_offset + col*nrows] = value;
+#else
                     data_d[d_offset + col] = FLOAT_TO_D(scale * FLOAT_TYPE(A_TO_FLOAT(data_a[a_offset + col])));
+#endif
                 }
             }
 #endif
