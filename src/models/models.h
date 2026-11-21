@@ -2517,8 +2517,10 @@ struct llama_model_inkling2 : public llama_model_base {
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
 
-    // the attn_rel_bias tables with their zero row, see load_tensors()
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> rel_bias_padded;
+    // weights built at load: the attn_rel_bias tables with their zero row, the stacked loop message queries
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> derived;
+    ggml_tensor * make_weight(llama_model_loader & ml, const std::vector<ggml_tensor *> & parts,
+            int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, const std::string & name);
 
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
@@ -2553,9 +2555,9 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] and their norms are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
+                ggml_tensor * messages = nullptr, ggml_tensor * message_norms = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
@@ -2587,6 +2589,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
     void post_arch_tensors(llama_model_loader & ml) override;
+    bool load_tensors(llama_model_loader & ml) override;
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;
@@ -2600,6 +2603,8 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
+    // the message queries of all core layers, [n_embd, LOOP_CTRL_COUNT, 1, core_end - core_start]
+    ggml_tensor * msg_queries = nullptr;
 
     struct graph : public llama_model_inkling2::graph {
         graph(const llm_graph_params & params);
