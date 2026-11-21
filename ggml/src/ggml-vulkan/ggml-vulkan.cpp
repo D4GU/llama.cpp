@@ -3315,6 +3315,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define OCP_DMMV_DATA(NAME, REDUC) NAME ## _data[REDUC]
 #endif
 
+    const void * const mul_mat_vec_soft_max_data[SHADER_REDUCTION_MODE_COUNT] = {
+        mul_mat_vec_soft_max_f32_f32_data, mul_mat_vec_soft_max_f32_f32_subgroup_data, mul_mat_vec_soft_max_f32_f32_subgroup_no_shmem_data };
+    const uint64_t mul_mat_vec_soft_max_len[SHADER_REDUCTION_MODE_COUNT] = {
+        mul_mat_vec_soft_max_f32_f32_len, mul_mat_vec_soft_max_f32_f32_subgroup_len, mul_mat_vec_soft_max_f32_f32_subgroup_no_shmem_len };
+
     for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
         const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
         const uint32_t wg_size_subgroup16 = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size16 : (subgroup_size16 * 4);
@@ -3329,6 +3334,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            // the same mat-vec over more rows, whose softmax of B runs on as many threads as SOFT_MAX does
+            if (w == DMMV_WG_SIZE_SUBGROUP && wg_size_subgroup == device->subgroup_size) {
+                const uint32_t rows = mul_mat_vec_soft_max_rows;
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_soft_max_f32[i], "mul_mat_vec_soft_max_f32_f32", mul_mat_vec_soft_max_len[reduc], mul_mat_vec_soft_max_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_soft_max_push_constants), {rows, 1, 1}, {wg_size_subgroup, rows, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -8279,6 +8289,76 @@ static void ggml_vk_mul_mat_vec_pair(ggml_backend_vk_context * ctx, vk_context& 
         2, 2, 1, 1,
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, dmmv, { pair.a, ggml_vk_tensor_subbuffer(ctx, mm->src[1]), pair.d, pair.d, pair.d }, pc, { m, 2, 1 });
+}
+
+// A SOFT_MAX that only an F32 mat-vec reads, such as the output mat-vec of an Inkling 2 depth mix. Every
+// workgroup of the mat-vec computes the softmax of its columns as soft_max.comp does, on as many threads
+static bool ggml_vk_can_fuse_mul_mat_vec_soft_max(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT }, { node_idx + 1 })) {
+        return false;
+    }
+    const ggml_tensor * sm = cgraph->nodes[node_idx];
+    const ggml_tensor * mm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * a  = mm->src[0];
+    float max_bias;
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+
+    // soft_max.comp with one pass over a row and no mask, ALiBi or sinks
+    if (mm->src[1] != sm || sm->src[1] || sm->src[2] || max_bias != 0.0f || sm->src[0]->type != GGML_TYPE_F32 ||
+        sm->type != GGML_TYPE_F32 || !ggml_is_contiguous(sm->src[0]) || !ggml_is_contiguous(sm) ||
+        get_misalign_bytes(ctx, sm->src[0]) != 0 || sm->ne[0] > ctx->device->subgroup_size ||
+        !ctx->device->pipeline_mul_mat_vec_soft_max_f32[0]) {
+        return false;
+    }
+    // the plain F32 mat-vec that ggml_vk_mul_mat runs, without a fused bias
+    const bool mat_vec = sm->ne[1] == 1 || (sm->ne[1] <= ggml_vk_mul_mat_vec_max_cols(ctx->device) && sm->ne[2] * sm->ne[3] == 1);
+    if (!mat_vec || a->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_is_contiguous(mm) ||
+        mm->ne[0] == 1 || ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+        a->ne[1] > ctx->device->properties.limits.maxComputeWorkGroupCount[0] ||
+        ggml_nbytes(a) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_vk_can_fuse(ctx, cgraph, node_idx + 1, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_vk_mul_mat_vec_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * sm = cgraph->nodes[node_idx];
+    const ggml_tensor * mm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * a  = mm->src[0];
+    float scale;
+    memcpy(&scale, (const float *) sm->op_params + 0, sizeof(float));
+
+    const uint32_t ne00 = (uint32_t)a->ne[0];
+    const uint32_t ne01 = (uint32_t)a->ne[1];
+    const uint32_t ne10 = (uint32_t)sm->ne[0];
+    const uint32_t ne11 = (uint32_t)sm->ne[1];
+    const uint32_t ne20 = (uint32_t)mm->ne[0];
+    const uint32_t ne21 = (uint32_t)mm->ne[1];
+    const uint32_t batches = (uint32_t)(sm->ne[2] * sm->ne[3]);
+
+    // the push constants of ggml_vk_mul_mat_vec_q_f16 for an F32 mat-vec, whose B binding
+    // holds the softmax input instead of its output, laid out alike
+    const bool batch_n = ne11 > 1;
+    vk_mat_vec_soft_max_push_constants pc = {
+        {
+            ne00, ne10, ne10, ne01,
+            batch_n ? 0 : ggml_vk_batch_stride(a), batch_n ? ne10 : ggml_vk_batch_stride(sm), batch_n ? ne20 : ne20*ne21,
+            0, 0,
+            (uint32_t)a->ne[2], (uint32_t)sm->ne[2], (uint32_t)(sm->ne[2] / a->ne[2]), (uint32_t)(sm->ne[3] / a->ne[3]),
+        },
+        scale, 0.0f, 0, 0,
+    };
+    vk_pipeline dmmv = ctx->device->pipeline_mul_mat_vec_soft_max_f32[ne11 - 1];
+    const uint32_t max_groups_y = ctx->device->properties.limits.maxComputeWorkGroupCount[1];
+    ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(batches, max_groups_y));
+
+    const vk_subbuffer d = ggml_vk_tensor_subbuffer(ctx, mm);
+    for (uint32_t base = 0; base < batches; base += max_groups_y) {
+        pc.mv.base_work_group_y = base;
+        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv, { ggml_vk_tensor_subbuffer(ctx, a), ggml_vk_tensor_subbuffer(ctx, sm->src[0]), d, d, d },
+                                  pc, { ne01, std::min(batches - base, max_groups_y), 1 });
+    }
 }
 
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -14129,6 +14209,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_SOFT_MAX:
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_mul_mat_vec_soft_max) {
+            ggml_vk_mul_mat_vec_soft_max(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_soft_max(ctx, compute_ctx, src0, src1, src2, node);
         }
@@ -16540,6 +16622,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_attn_rel_bias = false;
         ctx->fused_moe_router = false;
         ctx->fused_mul_mat_vec_pair = false;
+        ctx->fused_mul_mat_vec_soft_max = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_conv_state = nullptr;
         const char *fusion_string {};
@@ -16578,6 +16661,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask |= 1 << 0;
                 ctx->fused_mul_mat_vec_pair = true;
                 fusion_string = "MUL_MAT_VEC_PAIR";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+            } else if (ggml_vk_can_fuse_mul_mat_vec_soft_max(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_mul_mat_vec_soft_max = true;
+                fusion_string = "MUL_MAT_VEC_SOFT_MAX";
+                // every workgroup reads the whole softmax input
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
@@ -16872,6 +16962,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_attn_rel_bias = false;
                 ctx->fused_moe_router = false;
                 ctx->fused_mul_mat_vec_pair = false;
+                ctx->fused_mul_mat_vec_soft_max = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }

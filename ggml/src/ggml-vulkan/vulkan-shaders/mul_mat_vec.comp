@@ -16,6 +16,94 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 uint a_offset, b_offset, d_offset, y_offset;
 
+#ifdef SOFT_MAX_B
+// B is the softmax of the rows in data_b. Every workgroup computes it for its columns as soft_max.comp computes
+// a row of at most BLOCK_SIZE values: the same expressions, and the same reductions over as many threads.
+// Mask, ALiBi slope and sinks are never set, but stay runtime values so that the arithmetic compiles alike.
+shared FLOAT_TYPE sm_vals[BLOCK_SIZE];
+shared FLOAT_TYPE sm_b[NUM_COLS*BLOCK_SIZE];
+
+#define B_AT(i) sm_b[i]
+#define B_V4_AT(i) vec4(sm_b[4*(i)], sm_b[4*(i) + 1], sm_b[4*(i) + 2], sm_b[4*(i) + 3])
+
+void soft_max_b(const uint tid) {
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint col = tid;
+        const uint rowx = b_offset + j*p.batch_stride_b;
+
+        float slope = 1.0f;
+        if (p.sm_max_bias > 0.0f) {
+            slope = p.sm_max_bias;
+        }
+
+        FLOAT_TYPE max_val = p.sm_has_sinks == 0 ? uintBitsToFloat(0xFF800000) : FLOAT_TYPE(data_fuse1[0]);
+
+        FLOAT_TYPE a = FLOAT_TYPE(0);
+        if (col < p.ncols) {
+            a = data_b[rowx + col];
+        }
+
+        FLOAT_TYPE b = FLOAT_TYPE(0);
+        if (p.sm_ky > 0 && col < p.ncols) {
+            b = FLOAT_TYPE(data_fuse0[col]);
+        }
+
+        FLOAT_TYPE v = a * p.sm_scale + slope * b;
+
+        if (col < p.ncols) {
+            max_val = max(max_val, v);
+        }
+
+        FLOAT_TYPE data_cache = v;
+
+        sm_vals[tid] = max_val;
+        barrier();
+        [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sm_vals[tid] = max(sm_vals[tid], sm_vals[tid + s]);
+            }
+            barrier();
+        }
+
+        max_val = sm_vals[0];
+        barrier();
+
+        FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
+
+        if (col < p.ncols) {
+            FLOAT_TYPE val = exp(data_cache - max_val);
+            sum += val;
+            data_cache = val;
+        }
+
+        sm_vals[tid] = sum;
+        barrier();
+        [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sm_vals[tid] += sm_vals[tid + s];
+            }
+            barrier();
+        }
+        sum = sm_vals[0];
+
+        if (p.sm_has_sinks != 0) {
+            sum += FLOAT_TYPE(exp(FLOAT_TYPE(data_fuse1[0]) - max_val));
+        }
+
+        FLOAT_TYPE rcpdivisor = 1.0/sum;
+
+        if (col < p.ncols) {
+            sm_b[j*p.batch_stride_b + col] = data_cache * rcpdivisor;
+        }
+        barrier();
+    }
+    b_offset = 0;
+}
+#else
+#define B_AT(i) data_b[i]
+#define B_V4_AT(i) data_b_v4[i]
+#endif
+
 vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
     // Check if the latter elements are OOB, and don't fetch B or accumulate it.
     OOB_y = lastiter && (iybs + iqs + y_offset >= p.ncols);
@@ -23,21 +111,21 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, 
     OOB_w = lastiter && (iybs + iqs + y_offset*3 >= p.ncols);
 
     if (!OOB_w) {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*3]));
+        return vec4(FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs)),
+                 FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset)),
+                 FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2)),
+                 FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*3)));
     } else if (!OOB_z) {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2]),
+        return vec4(FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs)),
+                 FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset)),
+                 FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset*2)),
                  0);
     } else if (!OOB_y) {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
-                 FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]),
+        return vec4(FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs)),
+                 FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset)),
                  0, 0);
     } else {
-        return vec4(FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]),
+        return vec4(FLOAT_TYPE(B_AT(j*p.batch_stride_b + b_offset + iybs + iqs)),
                  0, 0, 0);
     }
 }
@@ -122,7 +210,7 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
         const uint iqs = 0; // quant index
         const uint iybs = col; // y block start index
 
-        const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
+        const vec4 b = B_V4_AT((j*p.batch_stride_b + b_offset + iybs + iqs) / 4);
 
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -142,6 +230,9 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
 
     get_offsets(a_offset, b_offset, d_offset);
+#ifdef SOFT_MAX_B
+    soft_max_b(tid);
+#endif
     const bool is_aligned_nonquant =
         p.batch_stride_b % 4 == 0 && p.ncols % 4 == 0 &&
         a_offset % 4 == 0 && b_offset % 4 == 0 &&
