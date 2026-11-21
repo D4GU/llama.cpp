@@ -13,6 +13,9 @@ layout(constant_id = 4) const bool APPLY_RESIDUAL = false;
 #if FUSED
 // skip + that, the residual ADD of the layer right after the convolution
 layout(constant_id = 5) const bool APPLY_SKIP = false;
+// x = concat(past, cur^T) is not materialized: src0 holds its first nc - 1 columns, the past, and res, which
+// is cur, the rest. The last token also writes the last nc - 1 columns of x to the state cache, as the CPY did
+layout(constant_id = 6) const bool READ_STATE = false;
 #endif
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
@@ -26,6 +29,7 @@ layout(binding = 3) buffer Dst { float dst[]; };
 #if FUSED
 // laid out like dst
 layout(binding = 4) readonly buffer Skip { float skip[]; };
+layout(binding = 5) writeonly buffer State { float state[]; };
 #endif
 
 layout(push_constant) uniform PushConstants {
@@ -34,7 +38,17 @@ layout(push_constant) uniform PushConstants {
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
     float res_scale; float res_bias;
+#if FUSED
+    uint state_nb1;
+#endif
 };
+
+// element j of src0 as x holds it, column i2 + j - src0_base
+#if FUSED
+#define LOAD_X(j) (READ_STATE && i2 + (j) - src0_base >= nc - 1 ? res[i3 * (dst_nb2 / 4) + (i2 + (j) - src0_base - (nc - 1)) * (dst_nb1 / 4) + i1] : src0[j])
+#else
+#define LOAD_X(j) src0[j]
+#endif
 
 void main() {
     const uint i1 = gl_GlobalInvocationID.x;
@@ -52,12 +66,12 @@ void main() {
 
     if (nc == 4) {
         sum = dot(
-            vec4(src0[src0_base], src0[src0_base + 1], src0[src0_base + 2], src0[src0_base + 3]),
+            vec4(LOAD_X(src0_base), LOAD_X(src0_base + 1), LOAD_X(src0_base + 2), LOAD_X(src0_base + 3)),
             vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3])
         );
     } else {
         [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
-            sum += src0[src0_base + i0] * src1[src1_base + i0];
+            sum += LOAD_X(src0_base + i0) * src1[src1_base + i0];
         }
     }
 
@@ -69,6 +83,14 @@ void main() {
     }
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+#if FUSED
+    // before the dst store, which may alias res when there is one token
+    if (READ_STATE && i2 == n_t - 1) {
+        for (uint i0 = 1; i0 < nc; i0++) {
+            state[i3 * state_nb1 + i1 * (nc - 1) + i0 - 1] = LOAD_X(src0_base + i0);
+        }
+    }
+#endif
     if (APPLY_RESIDUAL) {
         // as add.comp and scale.comp compute it
         sum = (res[dst_idx] + sum) * res_scale + res_bias;
