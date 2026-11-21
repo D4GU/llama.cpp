@@ -730,6 +730,9 @@ struct vk_op_l2_clip_push_constants {
     // the row multiplier, in the row_mul variant only
     uint32_t ne21, ne22, ne23;
     uint32_t t_offset;
+    // the destination row stride and a zero, in the set_rows variant only
+    uint32_t d_stride;
+    uint32_t zero;
 };
 
 struct vk_op_situ_push_constants {
