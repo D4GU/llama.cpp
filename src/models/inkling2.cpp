@@ -193,11 +193,20 @@ ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    if (!blocks.empty()) {
-        states = ggml_concat(ctx0, stack(blocks), states, 1);
+    ggml_tensor *& out = mixes[{blocks, cur, query}];
+    if (out) {
+        return out;
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
+
+    auto & [states, states_t] = depths[{blocks, cur}];
+    if (!states) {
+        states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+        if (!blocks.empty()) {
+            states = ggml_concat(ctx0, stack(blocks), states, 1);
+        }
+        states   = ggml_rms_norm(ctx0, states, 1e-6f);
+        states_t = ggml_cont(ctx0, ggml_transpose(ctx0, states));
+    }
 
     // a single token needs no copy of the query per token
     ggml_tensor * queries = n_tokens == 1 ? query
@@ -206,7 +215,7 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    return out = ggml_mul_mat(ctx0, states_t, scores);
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
