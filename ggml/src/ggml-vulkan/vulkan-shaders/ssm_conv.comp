@@ -16,6 +16,8 @@ layout(constant_id = 5) const bool APPLY_SKIP = false;
 // x = concat(past, cur^T) is not materialized: src0 holds its first nc - 1 columns, the past, and res, which
 // is cur, the rest. The last token also writes the last nc - 1 columns of x to the state cache, as the CPY did
 layout(constant_id = 6) const bool READ_STATE = false;
+// then adds window * tap for each lag, x shifted by nc - 1 - lag times the tap of the channel's head
+layout(constant_id = 7) const bool DYNAMIC_TAPS = false;
 #endif
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
@@ -30,6 +32,7 @@ layout(binding = 3) buffer Dst { float dst[]; };
 // laid out like dst
 layout(binding = 4) readonly buffer Skip { float skip[]; };
 layout(binding = 5) writeonly buffer State { float state[]; };
+layout(binding = 6) readonly buffer Taps { float taps[]; };
 #endif
 
 layout(push_constant) uniform PushConstants {
@@ -40,8 +43,19 @@ layout(push_constant) uniform PushConstants {
     float res_scale; float res_bias;
 #if FUSED
     uint state_nb1;
+    uint head_size; uint taps_nb1;
 #endif
 };
+
+#if FUSED
+// c + a * b rounded after the product and after the sum, as the MUL and ADD nodes compute it.
+// A function keeps precise from reaching the operations that computed c
+float mul_add(float c, float a, float b) {
+    precise float p = a * b;
+    precise float s = c + p;
+    return s;
+}
+#endif
 
 // element j of src0 as x holds it, column i2 + j - src0_base
 #if FUSED
@@ -84,6 +98,12 @@ void main() {
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
 #if FUSED
+    if (DYNAMIC_TAPS) {
+        const uint tap_base = (i3 * n_t + i2) * taps_nb1 + (i1 / head_size) * nc;
+        for (uint lag = 0; lag < nc; lag++) {
+            sum = mul_add(sum, LOAD_X(src0_base + nc - 1 - lag), taps[tap_base + lag]);
+        }
+    }
     // before the dst store, which may alias res when there is one token
     if (READ_STATE && i2 == n_t - 1) {
         for (uint i0 = 1; i0 < nc; i0++) {
