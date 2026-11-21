@@ -4293,10 +4293,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     for (uint32_t state : {0, 1}) {
         for (uint32_t skip : {0, 1}) {
             const std::string name = std::string("ssm_conv_res") + (state ? "_state" : "") + (skip ? "_skip" : "") + "_f32";
-            ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_res_f32[state][skip], name, ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 6,
-                                     sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1, skip, state}, 1);
+            ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_res_f32[state][skip], name, ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 7,
+                                     sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1, skip, state, 0}, 1);
         }
     }
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_dynamic_f32, "ssm_conv_dynamic_f32", ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 7,
+                            sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1, 0, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11633,28 +11635,33 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
-        1.0f, 0.0f, 0,
+        1.0f, 0.0f, 0, 0, 0,
     });
 }
 
-// node_idx is the SSM_CONV, the start of ssm_conv_res_pattern, or of ssm_conv_res_skip_pattern with one more fused op
+// node_idx is the SSM_CONV, the start of ssm_conv_res_pattern, or of ssm_conv_res_skip_pattern with one more fused op.
+// With dynamic taps it is the SCALE at the end of the tap chain, and the conv state names the rest
 static void ggml_vk_ssm_conv_res(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    const bool          with_skip = ctx->num_additional_fused_ops == (int) ssm_conv_res_skip_pattern.size() - 1;
-    const ggml_tensor * conv  = cgraph->nodes[node_idx];
-    const ggml_tensor * add   = cgraph->nodes[node_idx + 2];
-    const ggml_tensor * scale = cgraph->nodes[node_idx + 3];
+    const vk_conv_state * state   = ctx->fused_conv_state;
+    const bool            dynamic = state && state->taps;
+    const bool          with_skip = !dynamic && ctx->num_additional_fused_ops == (int) ssm_conv_res_skip_pattern.size() - 1;
+    const ggml_tensor * conv  = dynamic ? state->conv : cgraph->nodes[node_idx];
+    const ggml_tensor * scale = dynamic ? cgraph->nodes[node_idx] : cgraph->nodes[node_idx + 3];
     ggml_tensor *       dst   = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
     const ggml_tensor * src0  = conv->src[0];
     const ggml_tensor * src1  = conv->src[1];
-    const ggml_tensor * res   = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
-    // dst fills the unused bindings
-    const ggml_tensor * skip  = !with_skip ? dst : dst->src[0] == scale ? dst->src[1] : dst->src[0];
-    // with a conv state, the past columns of x take the place of x, and res supplies the rest
-    const vk_conv_state * state = ctx->fused_conv_state;
+    const ggml_tensor * res   = state ? state->cur : nullptr;
+    if (!res) {
+        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        res = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
+    }
+    // with a conv state, the past columns of x take the place of x, and res supplies the rest; dst fills the unused bindings
     const ggml_tensor * x     = state ? state->past : src0;
+    const ggml_tensor * skip  = !with_skip ? dst : dst->src[0] == scale ? dst->src[1] : dst->src[0];
     const ggml_tensor * store = state ? state->store : dst;
+    const ggml_tensor * taps  = dynamic ? state->taps : dst;
 
-    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_res_f32[state != nullptr][with_skip];
+    vk_pipeline pipeline = dynamic ? ctx->device->pipeline_ssm_conv_dynamic_f32 : ctx->device->pipeline_ssm_conv_res_f32[state != nullptr][with_skip];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     // dst is contiguous with the shape of the conv output, so the conv strides address it per sequence
@@ -11669,12 +11676,14 @@ static void ggml_vk_ssm_conv_res(ggml_backend_vk_context * ctx, vk_context& subc
         (uint32_t)conv->ne[2],
         ggml_get_op_params_f32(scale, 0), ggml_get_op_params_f32(scale, 1),
         (uint32_t)(store->nb[1] / sizeof(float)),
+        dynamic ? (uint32_t)(src0->ne[1] / (taps->ne[0] / src1->ne[0])) : 0, (uint32_t)(taps->nb[1] / sizeof(float)),
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
         ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, src1, true),
         ggml_vk_tensor_subbuffer(ctx, res, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
         ggml_vk_tensor_subbuffer(ctx, skip, true), ggml_vk_tensor_subbuffer(ctx, store, true),
+        ggml_vk_tensor_subbuffer(ctx, taps, true),
     }, pc, { (uint32_t)src0->ne[1], (uint32_t)conv->ne[1], (uint32_t)conv->ne[2] });
 }
 
@@ -13778,10 +13787,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 }
             }
         }
-        // the past and the state store of the CONCAT and CPY nodes a fused conv replaces
+        // what a fused conv reads and writes for the nodes it replaces
         if (const vk_conv_state * cs = ctx->fused_conv_state) {
-            need_sync = need_sync || overlaps_unsynced(cs->past, ctx->unsynced_nodes_written) ||
-                        overlaps_unsynced(cs->store, ctx->unsynced_nodes_read) || overlaps_unsynced(cs->store, ctx->unsynced_nodes_written);
+            for (const ggml_tensor * t : { cs->past, cs->cur, cs->taps }) {
+                need_sync = need_sync || (t && overlaps_unsynced(t, ctx->unsynced_nodes_written));
+            }
+            need_sync = need_sync || overlaps_unsynced(cs->store, ctx->unsynced_nodes_read) || overlaps_unsynced(cs->store, ctx->unsynced_nodes_written);
         }
 
         if (need_sync) {
@@ -13813,7 +13824,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             }
         }
         if (const vk_conv_state * cs = ctx->fused_conv_state) {
-            ctx->unsynced_nodes_read.push_back(cs->past);
+            for (const ggml_tensor * t : { cs->past, cs->cur, cs->taps }) {
+                if (t) {
+                    ctx->unsynced_nodes_read.push_back(t);
+                }
+            }
             ctx->unsynced_nodes_written.push_back(cs->store);
         }
     }
@@ -13922,7 +13937,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_SCALE:
-        if (ctx->fused_hc_post_gate) {
+        if (ctx->fused_conv_state) {
+            ggml_vk_ssm_conv_res(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_hc_post_gate) {
             ggml_tensor * hc_post = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
             ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], hc_post->src[2], hc_post->src[3], hc_post, node);
         } else {
@@ -15961,9 +15978,97 @@ static const ggml_tensor * ggml_vk_conv_state_concat(const struct ggml_cgraph * 
     return x;
 }
 
+// The tap chain of Inkling 2 convolve() with dynamic taps, from its SCALE back to the conv:
+// scale(add(cur, add(... add(reshape(ssm_conv(x, w)), term_0) ..., term_{nc-1})), s) with
+// term_lag = reshape(mul(reshape(cont(transpose(x shifted by nc - 1 - lag))), the taps at lag)).
+// nodes collects the computed nodes after the conv. Returns x, the CONCAT, or nullptr
+struct vk_conv_dynamic_chain {
+    ggml_tensor * conv;
+    ggml_tensor * cur;
+    ggml_tensor * taps;
+    std::vector<const ggml_tensor *> nodes;
+};
+
+static const ggml_tensor * ggml_vk_conv_dynamic_concat(const struct ggml_cgraph * cgraph, int node_idx, vk_conv_dynamic_chain & chain) {
+    const ggml_tensor * fin = cgraph->nodes[node_idx]->src[0];
+    if (cgraph->nodes[node_idx]->op != GGML_OP_SCALE || fin->op != GGML_OP_ADD || ggml_vk_use_count(cgraph, fin) != 1) {
+        return nullptr;
+    }
+    chain = { nullptr, fin->src[0], nullptr, { fin } };
+
+    // the MULs from the last lag to the first
+    std::vector<const ggml_tensor *> muls;
+    const ggml_tensor * out = fin->src[1];
+    for (; out->op == GGML_OP_ADD; out = out->src[0]) {
+        const ggml_tensor * term = out->src[1];
+        if (ggml_vk_use_count(cgraph, out) != 1 || term->op != GGML_OP_RESHAPE || term->src[0]->op != GGML_OP_MUL) {
+            return nullptr;
+        }
+        chain.nodes.push_back(out);
+        muls.push_back(term->src[0]);
+    }
+    if (out->op != GGML_OP_RESHAPE || out->src[0]->op != GGML_OP_SSM_CONV) {
+        return nullptr;
+    }
+    chain.conv = out->src[0];
+    chain.nodes.push_back(chain.conv);
+
+    const ggml_tensor * x  = chain.conv->src[0];
+    const int64_t       nc = chain.conv->src[1]->ne[0];
+    if ((int64_t) muls.size() != nc || ggml_vk_use_count(cgraph, chain.conv) != 1 ||
+        x->op != GGML_OP_CONCAT || ggml_get_op_params_i32(x, 0) != 0 || ggml_vk_use_count(cgraph, x) != nc + 2) {
+        return nullptr;
+    }
+    const ggml_tensor * xt = x->src[1];
+    if (xt->op != GGML_OP_TRANSPOSE || xt->src[0]->op != GGML_OP_RESHAPE || xt->src[0]->src[0] != chain.cur) {
+        return nullptr;
+    }
+
+    for (int64_t k = 0; k < nc; ++k) {
+        const int64_t       lag = nc - 1 - k;
+        const ggml_tensor * mul = muls[k];
+        const ggml_tensor * win = mul->src[0];
+        const ggml_tensor * tap = mul->src[1];
+        if (ggml_vk_use_count(cgraph, mul) != 1 || win->op != GGML_OP_RESHAPE || win->src[0]->op != GGML_OP_CONT ||
+            ggml_vk_use_count(cgraph, win->src[0]) != 1 || win->src[0]->src[0]->op != GGML_OP_TRANSPOSE) {
+            return nullptr;
+        }
+        const ggml_tensor * view = win->src[0]->src[0]->src[0];
+        if (view->op != GGML_OP_VIEW || view->src[0] != x || view->view_offs != x->view_offs + (nc - 1 - lag)*x->nb[0] ||
+            view->ne[0] != chain.conv->ne[1] || !ggml_are_same_stride(view, x)) {
+            return nullptr;
+        }
+        // one tap per head and token, broadcast over the channels of the head
+        if (tap->op != GGML_OP_VIEW || tap->src[0]->op != GGML_OP_RESHAPE || tap->ne[0] != 1 || tap->src[0]->ne[0] != nc ||
+            tap->ne[1] != win->ne[1] || tap->ne[2] != win->ne[2] || win->ne[0]*win->ne[1] != x->ne[1] ||
+            tap->view_offs != tap->src[0]->view_offs + lag*tap->src[0]->nb[0] || !ggml_are_same_stride(tap, tap->src[0]) ||
+            (chain.taps && tap->src[0]->src[0] != chain.taps)) {
+            return nullptr;
+        }
+        chain.taps = tap->src[0]->src[0];
+        chain.nodes.push_back(win->src[0]);
+        chain.nodes.push_back(mul);
+    }
+    return x;
+}
+
+// whether store copies the last columns of x, the past of the next ubatch, to a contiguous cell per sequence
+static bool ggml_vk_conv_store_ok(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, const ggml_tensor * x, const ggml_tensor * store) {
+    const ggml_tensor * tail   = store->src[0];
+    const ggml_tensor * past   = x->src[0];
+    const int64_t       n_cols = past->ne[0];
+    return ggml_vk_use_count(cgraph, tail) == 1 && tail->view_offs == x->view_offs + (x->ne[0] - n_cols)*x->nb[0] &&
+           tail->ne[0] == n_cols && ggml_are_same_stride(tail, x) &&
+           store->type == GGML_TYPE_F32 && store->nb[0] == sizeof(float) &&
+           store->ne[0] == n_cols*x->ne[1] && store->ne[1] == x->ne[2] && ggml_nrows(store) == x->ne[2] &&
+           past->type == GGML_TYPE_F32 && past->nb[0] == sizeof(float) &&
+           get_misalign_bytes(ctx, past) == 0 && get_misalign_bytes(ctx, store) == 0;
+}
+
 // Finds the short convolutions of this graph that run as one dispatch with their CONCAT and their state store CPY,
-// and the nodes that dispatch then replaces. Only convs that graph_optimize marked qualify, as only for those
-// the allocator keeps the past alive through the fused output.
+// and the nodes that dispatch then replaces: at the SSM_CONV when the conv ends in ssm_conv_res_pattern, at the
+// SCALE when it has dynamic taps. Only convs that graph_optimize marked qualify, as only for those the allocator
+// keeps what the dispatch reads alive through its output.
 static void ggml_vk_find_conv_states(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph) {
     ctx->conv_states.clear();
     ctx->conv_state_skip.clear();
@@ -15981,51 +16086,62 @@ static void ggml_vk_find_conv_states(ggml_backend_vk_context * ctx, const struct
     }
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * conv = cgraph->nodes[i];
-        if (conv->op != GGML_OP_SSM_CONV || ggml_get_op_params_i32(conv, 0) != 1) {
-            continue;
+        const ggml_tensor * node = cgraph->nodes[i];
+        vk_conv_dynamic_chain chain {};
+        const ggml_tensor * x = nullptr;
+        if (node->op == GGML_OP_SSM_CONV && ggml_get_op_params_i32(node, 0) == 1 && ggml_vk_can_fuse_ssm_conv_res(ctx, cgraph, i)) {
+            x = ggml_vk_conv_state_concat(cgraph, i);
+            chain = { cgraph->nodes[i], nullptr, nullptr, { node } };
+        } else if (node->op == GGML_OP_SCALE) {
+            x = ggml_vk_conv_dynamic_concat(cgraph, i, chain);
+            x = x && ggml_get_op_params_i32(chain.conv, 0) == 2 ? x : nullptr;
         }
-        const ggml_tensor * x = ggml_vk_conv_state_concat(cgraph, i);
         auto it = x ? stores.find(x) : stores.end();
-        if (it == stores.end() || !ggml_vk_can_fuse_ssm_conv_res(ctx, cgraph, i)) {
+        if (it == stores.end() || !ggml_vk_conv_store_ok(ctx, cgraph, x, it->second)) {
             continue;
         }
+
+        const ggml_tensor * conv  = chain.conv;
         const ggml_tensor * store = it->second;
-        const ggml_tensor * tail  = store->src[0];
         const ggml_tensor * past  = x->src[0];
-        const int64_t n_cols = past->ne[0];
-        const int64_t n_t    = conv->ne[1];
-
-        // the tail is the last n_cols columns of x, the store a contiguous cell per sequence
-        if (ggml_vk_use_count(cgraph, tail) != 1 || tail->view_offs != x->view_offs + n_t*x->nb[0] ||
-            tail->ne[0] != n_cols || !ggml_are_same_stride(tail, x) ||
-            store->type != GGML_TYPE_F32 || store->nb[0] != sizeof(float) ||
-            store->ne[0] != n_cols*x->ne[1] || store->ne[1] != x->ne[2] || ggml_nrows(store) != x->ne[2]) {
-            continue;
+        const ggml_tensor * dst   = node;
+        const ggml_tensor * skip  = nullptr;
+        if (!chain.taps) {
+            const bool with_skip = ggml_vk_can_fuse_ssm_conv_skip(ctx, cgraph, i);
+            const ggml_tensor * add = cgraph->nodes[i + 2];
+            chain.cur = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0];
+            dst  = cgraph->nodes[i + 3 + with_skip];
+            skip = with_skip ? (dst->src[0] == cgraph->nodes[i + 3] ? dst->src[1] : dst->src[0]) : nullptr;
+        } else {
+            // the shader reads cur and the taps at the dst index of a token, and writes dst densely
+            const ggml_tensor * taps = chain.taps;
+            if (chain.cur->type != GGML_TYPE_F32 || taps->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || conv->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(chain.cur, dst) || !ggml_is_contiguous(chain.cur) || !ggml_is_contiguous(dst) ||
+                !ggml_is_contiguous(taps) || ggml_nelements(dst) != ggml_nelements(conv) ||
+                get_misalign_bytes(ctx, chain.cur) != 0 || get_misalign_bytes(ctx, taps) != 0 || get_misalign_bytes(ctx, dst) != 0) {
+                continue;
+            }
         }
-        if (past->type != GGML_TYPE_F32 || past->nb[0] != sizeof(float) ||
-            get_misalign_bytes(ctx, past) != 0 || get_misalign_bytes(ctx, store) != 0) {
-            continue;
-        }
+        const ggml_tensor * cur = chain.cur;
+        const int64_t       n_t = conv->ne[1];
 
-        const bool          with_skip = ggml_vk_can_fuse_ssm_conv_skip(ctx, cgraph, i);
-        const ggml_tensor * dst       = cgraph->nodes[i + 3 + with_skip];
-        const ggml_tensor * add       = cgraph->nodes[i + 2];
-        const ggml_tensor * res       = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0];
-        const ggml_tensor * skip      = with_skip ? (dst->src[0] == cgraph->nodes[i + 3] ? dst->src[1] : dst->src[0]) : nullptr;
-        // the shader reads res across tokens, and writes the cell while it reads everything else
+        // the shader reads cur across tokens, and writes the cell while it reads everything else
         bool overlap = ggml_vk_tensors_overlap(past, dst, false) || ggml_vk_tensors_overlap(conv->src[1], dst, false) ||
-                       ggml_vk_tensors_overlap(res, dst, n_t == 1) || (skip && ggml_vk_tensors_overlap(skip, dst, true));
-        for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ past, conv->src[1], res, dst, skip }) {
+                       ggml_vk_tensors_overlap(cur, dst, n_t == 1) || (skip && ggml_vk_tensors_overlap(skip, dst, true)) ||
+                       (chain.taps && ggml_vk_tensors_overlap(chain.taps, dst, false));
+        for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ past, conv->src[1], cur, dst, skip, chain.taps }) {
             overlap = overlap || (t && ggml_vk_tensors_overlap(t, store, false));
         }
         if (overlap) {
             continue;
         }
 
-        ctx->conv_states[conv] = { past, store };
+        ctx->conv_states[node] = { conv, past, cur, store, chain.taps };
         ctx->conv_state_skip.insert(x);
         ctx->conv_state_skip.insert(store);
+        if (chain.taps) {
+            ctx->conv_state_skip.insert(chain.nodes.begin(), chain.nodes.end());
+        }
     }
 }
 
@@ -16338,13 +16454,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const char *fusion_string {};
         auto conv_state = ctx->conv_states.empty() ? ctx->conv_states.end() : ctx->conv_states.find(cgraph->nodes[i]);
         if (conv_state != ctx->conv_states.end()) {
-            // checked by ggml_vk_find_conv_states, including the overlaps
-            const bool with_skip = ggml_vk_can_fuse_ssm_conv_skip(ctx, cgraph, i);
-            ctx->num_additional_fused_ops = (with_skip ? ssm_conv_res_skip_pattern : ssm_conv_res_pattern).size() - 1;
-            ctx->fused_ssm_conv_res = true;
+            // checked by ggml_vk_find_conv_states, including the overlaps. With dynamic taps the SCALE runs the conv
             ctx->fused_conv_state = &conv_state->second;
-            fusion_string = with_skip ? "SSM_CONV_STATE_SKIP" : "SSM_CONV_STATE";
-        } else if (!ctx->device->disable_fusion) {
+            if (conv_state->second.taps) {
+                fusion_string = "SSM_CONV_DYNAMIC";
+            } else {
+                const bool with_skip = ggml_vk_can_fuse_ssm_conv_skip(ctx, cgraph, i);
+                ctx->num_additional_fused_ops = (with_skip ? ssm_conv_res_skip_pattern : ssm_conv_res_pattern).size() - 1;
+                ctx->fused_ssm_conv_res = true;
+                fusion_string = with_skip ? "SSM_CONV_STATE_SKIP" : "SSM_CONV_STATE";
+            }
+        } else if (!ctx->device->disable_fusion && !(ctx->conv_state_skip.size() && ctx->conv_state_skip.count(cgraph->nodes[i]))) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -17203,16 +17323,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         graph->nodes[i] = new_order[i];
     }
 
-    // A short convolution may read its past where the CONCAT read it (ggml_vk_find_conv_states), so keep the
-    // past alive through the fused output, and mark the SSM_CONV in its unused op params to say so
+    // A short convolution may read its past where the CONCAT read it, and with dynamic taps it runs at its SCALE
+    // (ggml_vk_find_conv_states). Keep what it reads alive through the fused output, and mark the SSM_CONV in its
+    // unused op params to say so: 1 for a conv that ends in ssm_conv_res_pattern, 2 for one with dynamic taps
     for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * x = ggml_vk_conv_state_concat(graph, i);
-        if (!x) {
-            continue;
+        vk_conv_dynamic_chain chain {};
+        if (const ggml_tensor * x = ggml_vk_conv_state_concat(graph, i)) {
+            const int last = i + 3 + ggml_can_fuse_subgraph(graph, i, ssm_conv_res_skip_pattern, { i + 4 });
+            params->add_alloc_dep(params->user_data, x->src[0], graph->nodes[last]);
+            ggml_set_op_params_i32(graph->nodes[i], 0, 1);
+        } else if (const ggml_tensor * x = ggml_vk_conv_dynamic_concat(graph, i, chain)) {
+            for (ggml_tensor * t : { x->src[0], chain.cur, chain.taps }) {
+                params->add_alloc_dep(params->user_data, t, graph->nodes[i]);
+            }
+            ggml_set_op_params_i32(chain.conv, 0, 2);
         }
-        const int last = i + 3 + ggml_can_fuse_subgraph(graph, i, ssm_conv_res_skip_pattern, { i + 4 });
-        params->add_alloc_dep(params->user_data, x->src[0], graph->nodes[last]);
-        ggml_set_op_params_i32(graph->nodes[i], 0, 1);
     }
 }
 
