@@ -323,6 +323,9 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // the rollback slot order {n_rs_seq, ..., 0} of build_conv_state_store, built by its first call
+    ggml_tensor * s_slot_rev = nullptr; // I32 [n_rs_seq + 1]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
