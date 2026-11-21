@@ -744,6 +744,13 @@ struct vk_op_loop_ctrl_push_constants {
     uint32_t rms_partials;
 };
 
+struct vk_op_attn_rel_bias_push_constants {
+    uint32_t ne;
+    uint32_t n_kv, n_seq_tokens, n_head, n_rel;
+    uint32_t t_offset, s_offset, r_offset, m_offset, d_offset;
+    uint32_t zero;
+};
+
 struct vk_op_pool1d_push_constants {
     uint32_t IL;
     uint32_t OL;
