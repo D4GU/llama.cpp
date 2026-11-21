@@ -160,6 +160,11 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
     return std::make_unique<graph>(params);
 }
 
+// a view of a single token is already contiguous, so generation skips these copies
+static ggml_tensor * contiguous(ggml_context * ctx, ggml_tensor * view) {
+    return ggml_is_contiguous(view) ? view : ggml_cont(ctx, view);
+}
+
 // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
     if (scale) {
@@ -298,7 +303,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+        return contiguous(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -312,7 +317,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = contiguous(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
         }
     }
 
@@ -457,7 +462,7 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     }
 
     // drop the padded vocabulary
-    cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+    cur = contiguous(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
