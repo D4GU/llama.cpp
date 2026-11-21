@@ -15397,10 +15397,10 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         if (get_misalign_bytes(ctx, scale) != 0) {
             return false;
         }
-        // shader only indexes by expert index
+        // shader only indexes by expert slot and token
         if (scale->ne[0] != 1 ||
             scale->ne[1] != mul->ne[1] ||
-            scale->ne[2] != 1 ||
+            scale->ne[2] != mul->ne[2] ||
             scale->ne[3] != 1) {
             return false;
         }
