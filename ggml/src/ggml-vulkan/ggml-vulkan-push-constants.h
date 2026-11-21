@@ -729,6 +729,15 @@ struct vk_op_l2_clip_push_constants {
     float clamp_min, clamp_max;
 };
 
+struct vk_op_situ_push_constants {
+    uint32_t ne;
+    uint32_t ne0, ne1, ne2;
+    uint32_t nb1, nb2, nb3;
+    uint32_t g_offset, u_offset, d_offset;
+    float g_scale, g_bias, g_out_scale, g_out_bias;
+    float u_scale, u_bias, u_out_scale, u_out_bias;
+};
+
 struct vk_op_pool1d_push_constants {
     uint32_t IL;
     uint32_t OL;
