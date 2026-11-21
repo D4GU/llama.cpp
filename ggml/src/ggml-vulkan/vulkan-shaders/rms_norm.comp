@@ -48,6 +48,11 @@ layout (binding = 4) readonly buffer E {float data_e[];};
 
 layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 
+// RADV merges scale * x and the f16 conversion into one v_fma_mixlo_f16 that rounds once, where the unfused
+// RMS_NORM rounds to f32 and SET_ROWS rounds that to f16. p.param3 is 0, a zero the compiler cannot see keeps both
+#undef FLOAT_TO_D
+#define FLOAT_TO_D(x) D_TYPE(uintBitsToFloat(floatBitsToUint(x) | uint(p.param3)))
+
 #elif RMS_NORM_MIX_FUSION
 
 // the depth states of Inkling 2 mix(): concat(stack, cur) along dim 1, normalized, plus a transposed copy.
