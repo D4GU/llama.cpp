@@ -156,6 +156,51 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+// a distance past the extent gathers a zero row of attn_rel_bias: append it once here instead of in every layer pass
+bool llama_model_inkling2::load_tensors(llama_model_loader & ml) {
+    if (!llama_model_base::load_tensors(ml)) {
+        return false;
+    }
+
+    // the looped cache slots share the tables of their physical layers
+    std::map<ggml_tensor *, ggml_tensor *> padded;
+    for (int il = 0; il < hparams.n_layer(); ++il) {
+        ggml_tensor *& bias = layers[il].attn_rel_bias;
+        auto it = padded.find(bias);
+        if (it == padded.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx { ggml_init(params) };
+            ggml_tensor * table = ggml_new_tensor_2d(ctx.get(), bias->type, bias->ne[0], bias->ne[1] + 1);
+            ggml_format_name(table, "%s.padded", bias->name);
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(bias->buffer);
+            ggml_backend_buffer_ptr buf { ml.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) : ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+            if (!buf) {
+                throw std::runtime_error(format("inkling2: unable to allocate %s", table->name));
+            }
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            if (ml.no_alloc) {
+                table->buffer = buf.get();
+            } else {
+                std::vector<uint8_t> data(ggml_nbytes(table), 0);
+                ggml_backend_tensor_get(bias, data.data(), 0, ggml_nbytes(bias));
+                ggml_backend_tensor_set(table, data.data(), 0, data.size());
+            }
+
+            rel_bias_padded.emplace_back(std::move(ctx), std::move(buf));
+            it = padded.emplace(bias, table).first;
+        }
+        bias = it->second;
+    }
+
+    return true;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }
@@ -393,7 +438,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        ggml_tensor * table = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
@@ -404,7 +449,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
         cb(kq_b, "kq_b", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        ggml_tensor *& zero = zero_sinks[n_head];
+        if (!zero) {
+            zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        }
+        sinks = zero;
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
