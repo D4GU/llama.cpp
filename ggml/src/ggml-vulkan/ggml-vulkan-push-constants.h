@@ -754,6 +754,14 @@ struct vk_op_attn_rel_bias_push_constants {
     uint32_t zero;
 };
 
+struct vk_op_moe_router_push_constants {
+    uint32_t nrows;
+    uint32_t n_used;
+    uint32_t logits_offset, bias_offset, ids_offset, w_offset;
+    float sum_scale, sum_bias;
+    float out_scale, out_bias;
+};
+
 struct vk_op_pool1d_push_constants {
     uint32_t IL;
     uint32_t OL;

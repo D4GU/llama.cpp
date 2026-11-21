@@ -3990,6 +3990,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             2 * sizeof(int) * BLOCK_SIZE <= device->properties.limits.maxComputeSharedMemorySize) {
             const uint32_t NCOLS_PADDED_LOG2 = i;
             ggml_vk_create_pipeline2(device, device->pipeline_argsort_f32[i], "argsort_f32_"+std::to_string(i), argsort_f32_len, argsort_f32_data, "main", 3, sizeof(vk_op_argsort_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, NCOLS_PADDED_LOG2}, 1, true);
+            // the router sorts one row per workgroup as this pipeline does, and sums with the block size of sum_rows
+            if (BLOCK_SIZE >= device->subgroup_size &&
+                3 * sizeof(int) * BLOCK_SIZE + sizeof(float) * device->subgroup_size <= device->properties.limits.maxComputeSharedMemorySize) {
+                ggml_vk_create_pipeline2(device, device->pipeline_moe_router_f32[i], "moe_router_f32_"+std::to_string(i), moe_router_f32_len, moe_router_f32_data, "main", 4, sizeof(vk_op_moe_router_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, NCOLS_PADDED_LOG2, device->subgroup_size}, 1, true);
+            }
         }
         const uint32_t WG_UNROLL_FACTOR = BLOCK_SIZE > 1 ? 2 : 1;
         BLOCK_SIZE /= WG_UNROLL_FACTOR;
@@ -12558,6 +12563,44 @@ void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cg
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {logits_buf, bias_buf, weights_buf, ids_buf}, pc, elements);
 }
 
+// null unless the unfused ARGSORT of n_expert columns runs argsort_f32 with one row per workgroup,
+// next to which ggml_vk_load_shaders creates the router pipeline
+static vk_pipeline ggml_vk_moe_router_pipeline(const vk_device & device, int64_t n_expert) {
+    if (n_expert > (1 << (num_argsort_pipelines - 1)) || !is_pow2((uint32_t) n_expert)) {
+        return nullptr;
+    }
+    return device->pipeline_moe_router_f32[(uint32_t) ceilf(log2f(float(n_expert)))];
+}
+
+// node_idx is the SIGMOID of moe_router_pattern
+static void ggml_vk_moe_router(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * logits    = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * bias      = cgraph->nodes[node_idx + 2]->src[1];
+    const ggml_tensor * ids       = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * sum_scale = cgraph->nodes[node_idx + 8];
+    const ggml_tensor * out_scale = cgraph->nodes[node_idx + 11];
+
+    const uint32_t n_expert = (uint32_t)logits->ne[0];
+    const uint32_t nrows    = (uint32_t)ggml_nrows(logits);
+
+    vk_pipeline pipeline = ggml_vk_moe_router_pipeline(ctx->device, n_expert);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_moe_router_push_constants pc = {
+        nrows, (uint32_t)ids->ne[0],
+        get_misalign_bytes(ctx, logits) / (uint32_t)sizeof(float), get_misalign_bytes(ctx, bias) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, ids) / (uint32_t)sizeof(int32_t), get_misalign_bytes(ctx, out_scale) / (uint32_t)sizeof(float),
+        ggml_get_op_params_f32(sum_scale, 0), ggml_get_op_params_f32(sum_scale, 1),
+        ggml_get_op_params_f32(out_scale, 0), ggml_get_op_params_f32(out_scale, 1),
+    };
+
+    const std::array<uint32_t, 3> elements = { n_expert, std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]), 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, logits, true), ggml_vk_tensor_subbuffer(ctx, bias, true),
+        ggml_vk_tensor_subbuffer(ctx, ids, true), ggml_vk_tensor_subbuffer(ctx, out_scale, true),
+    }, pc, elements);
+}
+
 void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, bool backprop) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
@@ -14041,6 +14084,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             ggml_vk_loop_ctrl(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
+        if (ctx->fused_moe_router) {
+            ggml_vk_moe_router(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->num_additional_fused_ops) {
             ggml_vk_unary_mul(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -15482,6 +15529,41 @@ bool ggml_vk_can_fuse_topk_moe(ggml_backend_vk_context * ctx, const struct ggml_
     return true;
 }
 
+// node_idx is the SIGMOID of moe_router_pattern. The fused kernel assumes the shapes build_moe_ffn gives and
+// the argsort_f32 pipeline whose workgroup is one row, so the bitonic network and its tie order are the same
+static bool ggml_vk_can_fuse_moe_router(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * sigmoid = cgraph->nodes[node_idx];
+    if (sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+        !ggml_can_fuse_subgraph(cgraph, node_idx, moe_router_pattern, { node_idx + 4, node_idx + 11 }) ||
+        !ggml_check_edges(cgraph, node_idx, moe_router_edges)) {
+        return false;
+    }
+
+    const ggml_tensor * logits  = sigmoid->src[0];
+    const ggml_tensor * probs   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * bias    = cgraph->nodes[node_idx + 2]->src[1];
+    const ggml_tensor * argsort = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * ids     = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * weights = cgraph->nodes[node_idx + 6];
+
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_rows   = logits->ne[1];
+    const int64_t n_used   = ids->ne[0];
+
+    // the other node types follow from the logits, only the ADD takes an f16 bias too
+    if (logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+        bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || bias->ne[0] != n_expert || ggml_nrows(bias) != 1 ||
+        ggml_get_op_params_i32(argsort, 0) != GGML_SORT_ORDER_DESC ||
+        ggml_vk_moe_router_pipeline(ctx->device, n_expert) == nullptr) {
+        return false;
+    }
+    // ids are the first n_used of each argsort row, probs [1, n_expert, n_rows] holds all rows of the logits,
+    // and each sum runs over the n_used weights of one row
+    return n_used <= n_expert && ids->view_offs == 0 && ids->nb[1] == argsort->nb[1] &&
+           probs->ne[0] == 1 && probs->ne[1] == n_expert && probs->ne[2] == n_rows && probs->ne[3] == 1 &&
+           weights->ne[0] == n_used;
+}
+
 static bool ggml_vk_match_ops(const struct ggml_cgraph * cgraph, int node_idx,
                               const std::initializer_list<ggml_op> & ops) {
     if (node_idx + (int) ops.size() > cgraph->n_nodes) {
@@ -16448,6 +16530,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ssm_conv_res = false;
         ctx->fused_mix_norm = false;
         ctx->fused_attn_rel_bias = false;
+        ctx->fused_moe_router = false;
         ctx->fused_mul_mat_vec_pair = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_conv_state = nullptr;
@@ -16651,6 +16734,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = true;
                 fusion_string = "TOPK_QSA";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (ggml_vk_can_fuse_moe_router(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = moe_router_pattern.size() - 1;
+                // view of argsort writes to memory
+                ctx->fused_ops_write_mask |= 1 << 4;
+                ctx->fused_moe_router = true;
+                fusion_string = "MOE_ROUTER";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_can_fuse_subgraph(cgraph, i, topk_moe_early_softmax_norm, { i + 3, i + 9 }) &&
                        ggml_check_edges(cgraph, i, topk_moe_early_softmax_norm_edges) &&
                        ggml_vk_can_fuse_topk_moe(ctx, cgraph, i, TOPK_MOE_EARLY_SOFTMAX_NORM)) {
@@ -16767,6 +16857,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ssm_conv_res = false;
                 ctx->fused_mix_norm = false;
                 ctx->fused_attn_rel_bias = false;
+                ctx->fused_moe_router = false;
                 ctx->fused_mul_mat_vec_pair = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
@@ -17036,6 +17127,13 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_topk_moe_pattern(topk_moe_late_softmax)) {
             continue;
         }
+        if (match_pattern(moe_router_pattern, first_unused) &&
+            ggml_vk_moe_router_pipeline(ctx->device, graph->nodes[first_unused]->ne[0]) != nullptr) {
+            // the fused op reads the logits at the output node, after the SIGMOID that frees them unfused
+            add_pattern_alloc_deps(moe_router_pattern, first_unused + (int) moe_router_pattern.size() - 1);
+            keep_pattern(moe_router_pattern);
+            continue;
+        }
         if (keep_pattern(snake_pattern)) {
             continue;
         }
@@ -17115,6 +17213,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
+                match_pattern(moe_router_pattern, j) ||
                 match_pattern(snake_pattern, j) ||
                 match_pattern(mul_l2_clip_pattern, j) ||
                 match_pattern(l2_clip_pattern, j) ||

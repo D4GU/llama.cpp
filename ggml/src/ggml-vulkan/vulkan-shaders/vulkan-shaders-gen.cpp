@@ -888,6 +888,7 @@ void process_shaders() {
     string_to_spv("situ_f32", "situ.comp", {});
     string_to_spv("loop_ctrl_f32", "loop_ctrl.comp", {});
     string_to_spv("attn_rel_bias", "attn_rel_bias.comp", {});
+    string_to_spv("moe_router_f32", "moe_router.comp", {});
 
     string_to_spv("cpy_32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});

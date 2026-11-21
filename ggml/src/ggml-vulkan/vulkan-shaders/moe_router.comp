@@ -1,0 +1,103 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused MoE router with sigmoid gating, a selection bias and normalized top-k weights:
+//   p = sigmoid(logits), ids = argsort(p + bias, desc)[:n_used], w = p[ids]
+//   weights = (w / (sum(w)*sum_scale + sum_bias)) * out_scale + out_bias
+// One workgroup per row, one invocation per expert, ids written into the rows of the argsort result.
+// The sort runs the bitonic network of argsort.comp and the sum the reduction of sum_rows.comp,
+// so ties and rounding come out as in the unfused ops.
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint N_EXPERT = 128;
+layout (constant_id = 1) const uint N_EXPERT_LOG2 = 7;
+layout (constant_id = 2) const uint SUM_BLOCK_SIZE = 32;
+
+layout (binding = 0) readonly  buffer L {float data_logits[];};
+layout (binding = 1) readonly  buffer B {float data_bias[];};
+layout (binding = 2) writeonly buffer I {int data_ids[];};
+layout (binding = 3) writeonly buffer W {float data_w[];};
+
+layout (push_constant) uniform parameter {
+    uint nrows;
+    uint n_used;
+    uint logits_offset, bias_offset, ids_offset, w_offset;
+    float sum_scale, sum_bias;
+    float out_scale, out_bias;
+} p;
+
+shared ivec2 dst_row[N_EXPERT];
+shared float probs[N_EXPERT];
+shared float tmp[SUM_BLOCK_SIZE];
+
+// as in unary.comp
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+void route(const uint row) {
+    const int col = int(gl_LocalInvocationID.x);
+
+    const float prob = op_sigmoid(data_logits[p.logits_offset + row * N_EXPERT + col]);
+    probs[col] = prob;
+    dst_row[col] = ivec2(col, floatBitsToInt(prob + data_bias[p.bias_offset + col]));
+    barrier();
+
+    [[unroll]] for (uint k = 2, outer_idx = 0; outer_idx < N_EXPERT_LOG2; k *= 2, outer_idx++) {
+        uint num_inner_loop_iters = outer_idx + 1;
+        [[unroll]] for (uint j = k / 2, inner_idx = 0; inner_idx < num_inner_loop_iters; j /= 2, inner_idx++) {
+            const int ixj = int(col ^ j);
+
+            if (ixj > col) {
+                int idx_0 = (col & k) == 0 ? col : ixj;
+                int idx_1 = (col & k) == 0 ? ixj : col;
+
+                ivec2 sh_idx_0 = dst_row[idx_0];
+                ivec2 sh_idx_1 = dst_row[idx_1];
+
+                if (intBitsToFloat(sh_idx_0.y) > intBitsToFloat(sh_idx_1.y)) {
+                    dst_row[idx_0] = sh_idx_1;
+                    dst_row[idx_1] = sh_idx_0;
+                }
+            }
+
+            barrier();
+        }
+    }
+
+    // the descending argsort stores the ascending order reversed
+    float w = 0.0f;
+    if (col < p.n_used) {
+        const int id = dst_row[N_EXPERT - 1 - col].x;
+        data_ids[p.ids_offset + row * N_EXPERT + col] = id;
+        w = probs[id];
+    }
+
+    if (col < SUM_BLOCK_SIZE) {
+        tmp[col] = 0.0f;
+        for (uint i = col; i < p.n_used; i += SUM_BLOCK_SIZE) {
+            tmp[col] += probs[dst_row[N_EXPERT - 1 - i].x];
+        }
+    }
+    barrier();
+    [[unroll]] for (int s = int(SUM_BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            tmp[col] += tmp[col + s];
+        }
+        barrier();
+    }
+
+    if (col < p.n_used) {
+        const float sum = tmp[0] * p.sum_scale + p.sum_bias;
+        data_w[p.w_offset + row * p.n_used + col] = (w / sum) * p.out_scale + p.out_bias;
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    while (row < p.nrows) {
+        route(row);
+        row += gl_NumWorkGroups.y;
+    }
+}
