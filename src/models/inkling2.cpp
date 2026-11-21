@@ -310,17 +310,19 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
-ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, ggml_tensor * message_norm,
+        const loop_layer & loop, int ctrl) {
     ggml_tensor *& cur_norm = norms[cur];
     if (!cur_norm) {
         cur_norm = ggml_rms_norm(ctx0, cur, 1e-6f);
     }
-    ggml_tensor * gate = ggml_concat(ctx0, cur_norm, ggml_rms_norm(ctx0, message, 1e-6f), 0);
+    ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
     ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
     ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
-    // both matmuls ahead of the elementwise tail, so that the tail is one contiguous chain a backend can fuse
+    // the message and both matmuls ahead of the elementwise tail, so that the tail is one contiguous chain a backend can fuse
+    ggml_build_forward_expand(gf, message);
     ggml_build_forward_expand(gf, forget);
     ggml_build_forward_expand(gf, gain);
     gain   = ggml_tanh(ctx0, gain);
@@ -364,10 +366,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_head  = hparams.n_embd_head_k(il);
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
-    // the message of controller ctrl, [n_embd, n_tokens]
-    auto message = [&](int ctrl) {
-        return contiguous(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+    // the message of controller ctrl, or its norm, [n_embd, n_tokens]
+    auto message = [&](ggml_tensor * t, int ctrl) {
+        return contiguous(ctx0, ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], ctrl*t->nb[1]));
     };
+    // one RMS_NORM for all messages, each row normalized on its own
+    ggml_tensor * message_norms = messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
     ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
@@ -388,7 +392,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     if (messages) {
         // the messages make the Q, K and V inputs of a SWA layer differ
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
+            inputs[j] = control(inputs[j], message(messages, LOOP_CTRL_Q + j), message(message_norms, LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
             // Vulkan sums the squares of a one-row RMS_NORM inside the ADD right before it, which rounds differently.
             // The original node order gave that path only to the full-attention Q input. Reading the others
             // through a view keeps them off it in any node order, so the output stays bit-identical
@@ -482,7 +486,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // MoE
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
     if (messages) {
-        cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+        cur = control(cur, message(messages, LOOP_CTRL_FFN), message(message_norms, LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
