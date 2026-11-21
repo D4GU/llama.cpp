@@ -5,11 +5,20 @@
 // Fused per-row L2 norm clip: y = x * clamp(threshold / (sqrt(sum(x*x)) * scale + bias), clamp_min, clamp_max)
 //   x = data_a, or data_a * data_b with do_multiply, where data_b broadcasts whole rows
 // With L2_CLIP_ROW_MUL, y is then multiplied by one value of data_t per row, broadcast as the MUL does
+// With L2_CLIP_SET_ROWS, y is stored as SET_ROWS does: x [ncols, ne01, ne02] goes to f16 row data_i[i02] of data_d
+#if defined(L2_CLIP_SET_ROWS)
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly  buffer A {float data_a[];};
 layout (binding = 1) readonly  buffer B {float data_b[];};
+#if defined(L2_CLIP_SET_ROWS)
+layout (binding = 2) writeonly buffer D {float16_t data_d[];};
+layout (binding = 3) readonly  buffer I {uvec2 data_i[];};
+#else
 layout (binding = 2) writeonly buffer D {float data_d[];};
+#endif
 #if defined(L2_CLIP_ROW_MUL)
 layout (binding = 3) readonly  buffer T {float data_t[];};
 #endif
@@ -26,9 +35,13 @@ layout (push_constant) uniform parameter {
     float scale, bias;
     float threshold;
     float clamp_min, clamp_max;
-#if defined(L2_CLIP_ROW_MUL)
+#if defined(L2_CLIP_ROW_MUL) || defined(L2_CLIP_SET_ROWS)
     uint ne21, ne22, ne23;
     uint t_offset;
+#endif
+#if defined(L2_CLIP_SET_ROWS)
+    uint d_stride;
+    uint zero;
 #endif
 } p;
 
@@ -55,7 +68,11 @@ void main() {
 
     const uint a_base = p.a_offset + row * p.ncols;
     const uint b_base = p.b_offset + (((i03 % p.ne13) * p.ne12 + i02 % p.ne12) * p.ne11 + i01 % p.ne11) * p.ncols;
+#if defined(L2_CLIP_SET_ROWS)
+    const uint d_base = p.d_offset + data_i[i02].x * p.d_stride + i01 * p.ncols;
+#else
     const uint d_base = p.d_offset + row * p.ncols;
+#endif
 
     // same summation order as sum_rows.comp; precise keeps each square rounded on its own,
     // as the separate SQR op stores it, instead of contracting it into an fma
@@ -83,6 +100,10 @@ void main() {
         const float x = do_multiply ? data_a[a_base + i] * data_b[b_base + i] : data_a[a_base + i];
 #if defined(L2_CLIP_ROW_MUL)
         data_d[d_base + i] = row_mul(x * factor, t);
+#elif defined(L2_CLIP_SET_ROWS)
+        // RADV would round x * factor straight to f16 in one v_fma_mixlo_f16. The unfused clip rounds to f32 and
+        // SET_ROWS rounds that to f16; a zero the compiler cannot see keeps both
+        data_d[d_base + i] = float16_t(uintBitsToFloat(floatBitsToUint(x * factor) | p.zero));
 #else
         data_d[d_base + i] = x * factor;
 #endif

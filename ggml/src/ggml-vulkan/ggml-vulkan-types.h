@@ -602,6 +602,18 @@ static constexpr std::initializer_list<ggml_op> mul_l2_clip_row_mul_pattern { GG
                                                                               GGML_OP_DIV,  GGML_OP_CLAMP, GGML_OP_MUL,
                                                                               GGML_OP_MUL };
 
+// the same without the MUL, stored into a cache as cpy_k stores the K rows
+static constexpr std::initializer_list<ggml_op> l2_clip_view_set_rows_pattern { GGML_OP_SQR,   GGML_OP_SUM_ROWS, GGML_OP_SQRT,
+                                                                                GGML_OP_SCALE, GGML_OP_FILL,     GGML_OP_DIV,
+                                                                                GGML_OP_CLAMP, GGML_OP_MUL,      GGML_OP_VIEW,
+                                                                                GGML_OP_SET_ROWS };
+
+// relative to the SQR node
+static constexpr std::initializer_list<std::array<int, 3>> l2_clip_view_set_rows_edges {
+    { 8, 0, 7 }, // view->src[0]     == mul
+    { 9, 0, 8 }, // set_rows->src[0] == view
+};
+
 // relative to the SQR node
 static constexpr std::initializer_list<std::array<int, 3>> l2_clip_edges {
     { 1, 0, 0 }, // sum_rows->src[0] == sqr
@@ -1081,6 +1093,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_l2_norm_f32;
     vk_pipeline pipeline_l2_clip_f32[2]; // [with leading MUL]
     vk_pipeline pipeline_mul_l2_clip_row_mul_f32;
+    vk_pipeline pipeline_l2_clip_set_rows_f16;
     vk_pipeline pipeline_situ_f32;
     vk_pipeline pipeline_loop_ctrl_f32;
     vk_pipeline pipeline_attn_rel_bias;

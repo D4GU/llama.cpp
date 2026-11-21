@@ -3695,6 +3695,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32[0], "l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 3, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 0 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32[1], "mul_l2_clip_f32", l2_clip_f32_len, l2_clip_f32_data, "main", 3, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 1 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_mul_l2_clip_row_mul_f32, "mul_l2_clip_row_mul_f32", l2_clip_row_mul_f32_len, l2_clip_row_mul_f32_data, "main", 4, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 1 }, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_l2_clip_set_rows_f16, "l2_clip_set_rows_f16", l2_clip_set_rows_f16_len, l2_clip_set_rows_f16_data, "main", 4, sizeof(vk_op_l2_clip_push_constants), {1, 1, 1}, { device->subgroup_size, 0 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_situ_f32, "situ_f32", situ_f32_len, situ_f32_data, "main", 3, sizeof(vk_op_situ_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_loop_ctrl_f32, "loop_ctrl_f32", loop_ctrl_f32_len, loop_ctrl_f32_data, "main", 6, sizeof(vk_op_loop_ctrl_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_attn_rel_bias, "attn_rel_bias", attn_rel_bias_len, attn_rel_bias_data, "main", 5, sizeof(vk_op_attn_rel_bias_push_constants), {512, 1, 1}, {}, 1);
@@ -13264,20 +13265,22 @@ void ggml_vk_snake_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& sub
 }
 
 static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
-    const bool with_mul = cgraph->nodes[node_idx]->op == GGML_OP_MUL;
-    const bool row_mul  = ctx->num_additional_fused_ops == (int) mul_l2_clip_row_mul_pattern.size() - 1;
+    ggml_tensor *       dst      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    const bool          with_mul = cgraph->nodes[node_idx]->op == GGML_OP_MUL;
+    const bool          set_rows = dst->op == GGML_OP_SET_ROWS;
+    const bool          row_mul  = !set_rows && ctx->num_additional_fused_ops == (int) mul_l2_clip_row_mul_pattern.size() - 1;
     const ggml_tensor * sqr    = cgraph->nodes[node_idx + with_mul];
     const ggml_tensor * norm   = cgraph->nodes[node_idx + with_mul + 3];
     const ggml_tensor * fill   = cgraph->nodes[node_idx + with_mul + 4];
     const ggml_tensor * factor = cgraph->nodes[node_idx + with_mul + 6];
-    ggml_tensor *       dst    = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
 
     const ggml_tensor * x = with_mul ? sqr->src[0]->src[0] : sqr->src[0];
     // without the MUL the shader never reads w, x only fills its binding
     const ggml_tensor * w = with_mul ? sqr->src[0]->src[1] : x;
     const ggml_tensor * t = row_mul ? dst->src[1] : nullptr;
 
-    vk_pipeline pipeline = row_mul ? ctx->device->pipeline_mul_l2_clip_row_mul_f32 : ctx->device->pipeline_l2_clip_f32[with_mul];
+    vk_pipeline pipeline = set_rows ? ctx->device->pipeline_l2_clip_set_rows_f16 :
+                           row_mul  ? ctx->device->pipeline_mul_l2_clip_row_mul_f32 : ctx->device->pipeline_l2_clip_f32[with_mul];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const uint32_t nrows = (uint32_t)ggml_nrows(x);
@@ -13293,6 +13296,9 @@ static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context& subctx, g
         0,
     };
     init_pushconst_tensor_offsets(ctx, pc, x, w, t, nullptr, dst);
+    if (set_rows) {
+        pc.d_stride = dst->nb[1] / ggml_type_size(dst->type);
+    }
 
     // one workgroup per row, laid out as for sum_rows
     std::array<uint32_t, 3> elements;
@@ -13304,10 +13310,11 @@ static void ggml_vk_l2_clip(ggml_backend_vk_context * ctx, vk_context& subctx, g
         elements = { nrows, 1, 1 };
     }
 
-    if (row_mul) {
+    if (row_mul || set_rows) {
+        // the row multiplier, or the destination row of each ne2 slice
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
             ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
-            ggml_vk_tensor_subbuffer(ctx, t, true),
+            ggml_vk_tensor_subbuffer(ctx, dst->src[1], true),
         }, pc, elements);
     } else {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
@@ -15792,6 +15799,29 @@ static bool ggml_vk_can_fuse_l2_clip(const struct ggml_cgraph * cgraph, int node
     return true;
 }
 
+// each ne2 slice of the clipped x is one destination row, as for RMS_NORM + VIEW + SET_ROWS
+static bool ggml_vk_can_fuse_l2_clip_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_can_fuse_l2_clip(cgraph, node_idx, false, false) ||
+        !ggml_can_fuse_subgraph(cgraph, node_idx, l2_clip_view_set_rows_pattern, { node_idx + 9 }) ||
+        !ggml_check_edges(cgraph, node_idx, l2_clip_view_set_rows_edges)) {
+        return false;
+    }
+
+    const ggml_tensor * x        = cgraph->nodes[node_idx]->src[0];
+    const ggml_tensor * view     = cgraph->nodes[node_idx + 8];
+    const ggml_tensor * set_rows = cgraph->nodes[node_idx + 9];
+    const ggml_tensor * idxs     = set_rows->src[1];
+    if (set_rows->type != GGML_TYPE_F16 || set_rows->nb[0] != ggml_type_size(set_rows->type) ||
+        idxs->type != GGML_TYPE_I64 || !ggml_is_contiguous(idxs) || get_misalign_bytes(ctx, idxs) != 0) {
+        return false;
+    }
+    if (x->ne[3] != 1 || !ggml_is_contiguous(view) || view->ne[0] != x->ne[0] * x->ne[1] || view->ne[1] != x->ne[2] ||
+        view->ne[2] != 1 || view->ne[3] != 1 || ggml_nelements(idxs) != x->ne[2]) {
+        return false;
+    }
+    return true;
+}
+
 // node_idx is the gate CONT, situ_pattern starts at the gate VIEW before it
 static bool ggml_vk_can_fuse_situ(const struct ggml_cgraph * cgraph, int node_idx) {
     const int start = node_idx - 1;
@@ -16677,6 +16707,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
+            } else if (ggml_vk_can_fuse_l2_clip_set_rows(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = l2_clip_view_set_rows_pattern.size() - 1;
+                ctx->fused_l2_clip = true;
+                fusion_string = "L2_CLIP_SET_ROWS";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_l2_clip(cgraph, i, true, true) || ggml_vk_can_fuse_l2_clip(cgraph, i, true, false) ||
                        ggml_vk_can_fuse_l2_clip(cgraph, i, false, false)) {
                 const bool with_mul = cgraph->nodes[i]->op == GGML_OP_MUL;
@@ -17074,6 +17109,45 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         };
 
+        // Look for a VIEW + SET_ROWS within window nodes that stores node idx, and append both to set so that they follow it
+        auto const &pull_view_set_rows = [&](int idx, int window, std::vector<int> &set) {
+            int view_idx = -1;
+            int set_rows_idx = -1;
+            for (int k = idx + 1; k < std::min(idx + window, graph->n_nodes); ++k) {
+                if (used[k]) {
+                    continue;
+                }
+                if (view_idx == -1 && graph->nodes[k]->op == GGML_OP_VIEW && graph->nodes[k]->src[0] == graph->nodes[idx]) {
+                    view_idx = k;
+                    continue;
+                }
+                if (view_idx != -1 && graph->nodes[k]->op == GGML_OP_SET_ROWS && graph->nodes[k]->src[0] == graph->nodes[view_idx]) {
+                    set_rows_idx = k;
+                    break;
+                }
+            }
+            if (set_rows_idx == -1) {
+                return;
+            }
+            const int node_idxs[] = { idx, view_idx, set_rows_idx };
+            const ggml_op ops[] = { graph->nodes[idx]->op, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+            bool can_pull = ggml_can_fuse_subgraph_ext(graph, node_idxs, 3, ops, &set_rows_idx, 1);
+
+            for (int c = idx + 1; can_pull && c < set_rows_idx; ++c) {
+                if (!used[c] && c != view_idx && !is_empty(graph->nodes[c]) &&
+                    is_src_of(graph->nodes[set_rows_idx], graph->nodes[c])) {
+                    can_pull = false;
+                }
+            }
+
+            if (can_pull) {
+                set.push_back(view_idx);
+                set.push_back(set_rows_idx);
+                used[view_idx] = true;
+                used[set_rows_idx] = true;
+            }
+        };
+
         auto const &keep_topk_moe_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (!match_pattern(pattern, first_unused)) {
                 return false;
@@ -17115,7 +17189,18 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
-        if (keep_pattern(mul_l2_clip_pattern) || keep_pattern(l2_clip_pattern)) {
+        if (keep_pattern(mul_l2_clip_pattern)) {
+            continue;
+        }
+        if (match_pattern(l2_clip_pattern, first_unused)) {
+            // cpy_k stores the clipped K rows after the whole V chain, so look past it for the store
+            std::vector<int> store;
+            pull_view_set_rows(first_unused + (int) l2_clip_pattern.size() - 1, graph->n_nodes, store);
+            keep_pattern(l2_clip_pattern);
+            for (int k : store) {
+                new_order.push_back(graph->nodes[k]);
+                used_node_set.insert(graph->nodes[k]);
+            }
             continue;
         }
         if (match_pattern(situ_pattern, first_unused)) {
@@ -17167,51 +17252,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
-        // Look for ROPE/RMS_NORM + VIEW + SET_ROWS and make them consecutive
-        auto const &pull_view_set_rows = [&](int idx) {
-            if (graph->nodes[idx]->op != GGML_OP_ROPE && graph->nodes[idx]->op != GGML_OP_RMS_NORM) {
-                return;
-            }
-            int view_idx = -1;
-            int set_rows_idx = -1;
-            for (int k = idx + 1; k < std::min(idx + 15, graph->n_nodes); ++k) {
-                if (used[k]) {
-                    continue;
-                }
-                if (view_idx == -1 && graph->nodes[k]->op == GGML_OP_VIEW && graph->nodes[k]->src[0] == graph->nodes[idx]) {
-                    view_idx = k;
-                    continue;
-                }
-                if (view_idx != -1 && graph->nodes[k]->op == GGML_OP_SET_ROWS && graph->nodes[k]->src[0] == graph->nodes[view_idx]) {
-                    set_rows_idx = k;
-                    break;
-                }
-            }
-            if (set_rows_idx == -1) {
-                return;
-            }
-            const int node_idxs[] = { idx, view_idx, set_rows_idx };
-            const ggml_op ops[] = { graph->nodes[idx]->op, GGML_OP_VIEW, GGML_OP_SET_ROWS };
-            bool can_pull = ggml_can_fuse_subgraph_ext(graph, node_idxs, 3, ops, &set_rows_idx, 1);
-
-            for (int c = idx + 1; can_pull && c < set_rows_idx; ++c) {
-                if (!used[c] && c != view_idx && !is_empty(graph->nodes[c]) &&
-                    is_src_of(graph->nodes[set_rows_idx], graph->nodes[c])) {
-                    can_pull = false;
-                }
-            }
-
-            if (can_pull) {
-                current_set.push_back(view_idx);
-                current_set.push_back(set_rows_idx);
-                used[view_idx] = true;
-                used[set_rows_idx] = true;
-            }
-        };
-
         // First, grab the next unused node.
         current_set.push_back(first_unused);
-        pull_view_set_rows(first_unused);
+        if (graph->nodes[first_unused]->op == GGML_OP_ROPE || graph->nodes[first_unused]->op == GGML_OP_RMS_NORM) {
+            pull_view_set_rows(first_unused, 15, current_set);
+        }
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
@@ -17293,7 +17338,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         }
                     }
                 }
-                pull_view_set_rows(rope_idx);
+                if (graph->nodes[rope_idx]->op == GGML_OP_ROPE || graph->nodes[rope_idx]->op == GGML_OP_RMS_NORM) {
+                    pull_view_set_rows(rope_idx, 15, current_set);
+                }
                 // Look for MUL_MAT_ID + ADD_ID + MUL
                 if (j > 0 &&
                     graph->nodes[j]->op == GGML_OP_ADD_ID &&
