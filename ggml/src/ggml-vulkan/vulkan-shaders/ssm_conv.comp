@@ -10,6 +10,10 @@ layout(constant_id = 2) const bool APPLY_BIAS = false;
 layout(constant_id = 3) const bool APPLY_SILU = false;
 // (res + conv) * res_scale + res_bias, the ADD and SCALE of a residual after the convolution
 layout(constant_id = 4) const bool APPLY_RESIDUAL = false;
+#if FUSED
+// skip + that, the residual ADD of the layer right after the convolution
+layout(constant_id = 5) const bool APPLY_SKIP = false;
+#endif
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
@@ -19,6 +23,10 @@ layout(binding = 2) readonly buffer Bias { float bias[]; };
 // with APPLY_RESIDUAL, binding 2 holds the residual instead, laid out like dst
 layout(binding = 2) readonly buffer Res { float res[]; };
 layout(binding = 3) buffer Dst { float dst[]; };
+#if FUSED
+// laid out like dst
+layout(binding = 4) readonly buffer Skip { float skip[]; };
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
@@ -65,5 +73,11 @@ void main() {
         // as add.comp and scale.comp compute it
         sum = (res[dst_idx] + sum) * res_scale + res_bias;
     }
+#if FUSED
+    if (APPLY_SKIP) {
+        // as add.comp computes it, either operand order gives the same sum
+        sum = skip[dst_idx] + sum;
+    }
+#endif
     dst[dst_idx] = sum;
 }
