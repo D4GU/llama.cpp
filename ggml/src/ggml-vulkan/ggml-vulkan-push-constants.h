@@ -871,6 +871,7 @@ struct vk_op_ssm_conv_push_constants {
     float res_scale, res_bias;
     uint32_t state_nb1;
     uint32_t head_size, taps_nb1;
+    uint32_t n_slots, slot_stride;
 };
 
 struct vk_op_conv2d_push_constants {

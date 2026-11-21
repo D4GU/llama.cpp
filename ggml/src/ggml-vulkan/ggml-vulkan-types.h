@@ -699,13 +699,15 @@ static constexpr std::initializer_list<ggml_op> ssm_conv_res_skip_pattern { GGML
 
 // what a short convolution reads and writes when it replaces the CONCAT of its past and the CPY of its
 // state store: past is the CONCAT's first src, store the CPY whose dst is the state cache, cur the current
-// tokens. With dynamic taps it also replaces the tap chain up to the SCALE, and reads taps
+// tokens. With dynamic taps it also replaces the tap chain up to the SCALE, and reads taps. With rollback
+// slots the store is a SET_ROWS of the last windows of x, and slot_idx its row indices
 struct vk_conv_state {
     const ggml_tensor * conv;
     const ggml_tensor * past;
     const ggml_tensor * cur;
     const ggml_tensor * store;
     const ggml_tensor * taps;
+    const ggml_tensor * slot_idx;
 };
 
 // the depth states of Inkling 2 mix(): rms_norm(concat(stack, cur, 1)) and its transposed copy

@@ -4313,11 +4313,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     for (uint32_t state : {0, 1}) {
         for (uint32_t skip : {0, 1}) {
             const std::string name = std::string("ssm_conv_res") + (state ? "_state" : "") + (skip ? "_skip" : "") + "_f32";
-            ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_res_f32[state][skip], name, ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 7,
+            ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_res_f32[state][skip], name, ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 8,
                                      sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1, skip, state, 0}, 1);
         }
     }
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_dynamic_f32, "ssm_conv_dynamic_f32", ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 7,
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_dynamic_f32, "ssm_conv_dynamic_f32", ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 8,
                             sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1, 0, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -11725,7 +11725,7 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
-        1.0f, 0.0f, 0, 0, 0,
+        1.0f, 0.0f, 0, 0, 0, 0, 0,
     });
 }
 
@@ -11750,6 +11750,8 @@ static void ggml_vk_ssm_conv_res(ggml_backend_vk_context * ctx, vk_context& subc
     const ggml_tensor * skip  = !with_skip ? dst : dst->src[0] == scale ? dst->src[1] : dst->src[0];
     const ggml_tensor * store = state ? state->store : dst;
     const ggml_tensor * taps  = dynamic ? state->taps : dst;
+    // a SET_ROWS store is [n_cols, slot, channel, seq] and writes rows slot_idx[0..n_slots), a CPY store [n_cols*channel, seq]
+    const ggml_tensor * slot_idx = state ? state->slot_idx : nullptr;
 
     vk_pipeline pipeline = dynamic ? ctx->device->pipeline_ssm_conv_dynamic_f32 : ctx->device->pipeline_ssm_conv_res_f32[state != nullptr][with_skip];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -11765,15 +11767,16 @@ static void ggml_vk_ssm_conv_res(ggml_backend_vk_context * ctx, vk_context& subc
         (uint32_t)conv->ne[1],
         (uint32_t)conv->ne[2],
         ggml_get_op_params_f32(scale, 0), ggml_get_op_params_f32(scale, 1),
-        (uint32_t)(store->nb[1] / sizeof(float)),
+        (uint32_t)((slot_idx ? store->nb[3] : store->nb[1]) / sizeof(float)),
         dynamic ? (uint32_t)(src0->ne[1] / (taps->ne[0] / src1->ne[0])) : 0, (uint32_t)(taps->nb[1] / sizeof(float)),
+        slot_idx ? (uint32_t)slot_idx->ne[0] : 1, slot_idx ? (uint32_t)(store->nb[1] / sizeof(float)) : 0,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
         ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, src1, true),
         ggml_vk_tensor_subbuffer(ctx, res, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
         ggml_vk_tensor_subbuffer(ctx, skip, true), ggml_vk_tensor_subbuffer(ctx, store, true),
-        ggml_vk_tensor_subbuffer(ctx, taps, true),
+        ggml_vk_tensor_subbuffer(ctx, taps, true), ggml_vk_tensor_subbuffer(ctx, slot_idx ? slot_idx : dst, true),
     }, pc, { (uint32_t)src0->ne[1], (uint32_t)conv->ne[1], (uint32_t)conv->ne[2] });
 }
 
@@ -13923,7 +13926,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         // what a fused conv reads and writes for the nodes it replaces
         if (const vk_conv_state * cs = ctx->fused_conv_state) {
-            for (const ggml_tensor * t : { cs->past, cs->cur, cs->taps }) {
+            for (const ggml_tensor * t : { cs->past, cs->cur, cs->taps, cs->slot_idx }) {
                 need_sync = need_sync || (t && overlaps_unsynced(t, ctx->unsynced_nodes_written));
             }
             need_sync = need_sync || overlaps_unsynced(cs->store, ctx->unsynced_nodes_read) || overlaps_unsynced(cs->store, ctx->unsynced_nodes_written);
@@ -13958,7 +13961,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             }
         }
         if (const vk_conv_state * cs = ctx->fused_conv_state) {
-            for (const ggml_tensor * t : { cs->past, cs->cur, cs->taps }) {
+            for (const ggml_tensor * t : { cs->past, cs->cur, cs->taps, cs->slot_idx }) {
                 if (t) {
                     ctx->unsynced_nodes_read.push_back(t);
                 }
@@ -16248,20 +16251,52 @@ static const ggml_tensor * ggml_vk_conv_dynamic_concat(const struct ggml_cgraph 
     return x;
 }
 
-// whether store copies the last columns of x, the past of the next ubatch, to a contiguous cell per sequence
-static bool ggml_vk_conv_store_ok(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, const ggml_tensor * x, const ggml_tensor * store) {
-    const ggml_tensor * tail   = store->src[0];
-    const ggml_tensor * past   = x->src[0];
-    const int64_t       n_cols = past->ne[0];
-    return ggml_vk_use_count(cgraph, tail) == 1 && tail->view_offs == x->view_offs + (x->ne[0] - n_cols)*x->nb[0] &&
-           tail->ne[0] == n_cols && ggml_are_same_stride(tail, x) &&
-           store->type == GGML_TYPE_F32 && store->nb[0] == sizeof(float) &&
-           store->ne[0] == n_cols*x->ne[1] && store->ne[1] == x->ne[2] && ggml_nrows(store) == x->ne[2] &&
-           past->type == GGML_TYPE_F32 && past->nb[0] == sizeof(float) &&
-           get_misalign_bytes(ctx, past) == 0 && get_misalign_bytes(ctx, store) == 0;
+// the state stores of build_conv_state_store, by x: cpy(view of x, cell of the state cache), or with rollback
+// slots set_rows(slots of the cell, windows of x, slot order)
+static std::unordered_map<const ggml_tensor *, const ggml_tensor *> ggml_vk_conv_stores(const struct ggml_cgraph * cgraph) {
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> stores;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS) && node->src[0]->op == GGML_OP_VIEW &&
+            node->src[0]->src[0]->op == GGML_OP_CONCAT) {
+            stores[node->src[0]->src[0]] = node;
+        }
+    }
+    return stores;
 }
 
-// Finds the short convolutions of this graph that run as one dispatch with their CONCAT and their state store CPY,
+// whether store writes the last columns of x, the past of the next ubatch, to a contiguous cell per sequence.
+// A SET_ROWS store writes the window of x after each of the last tokens to its rollback slot of the cell,
+// and its indices go to slot_idx
+static bool ggml_vk_conv_store_ok(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, const ggml_tensor * x,
+                                  const ggml_tensor * store, const ggml_tensor ** slot_idx) {
+    const ggml_tensor * src    = store->src[0];
+    const ggml_tensor * past   = x->src[0];
+    const int64_t       n_cols = past->ne[0];
+    const int64_t       n_t    = x->ne[0] - n_cols;
+    *slot_idx = nullptr;
+    if (ggml_vk_use_count(cgraph, src) != 1 || store->type != GGML_TYPE_F32 || store->nb[0] != sizeof(float) ||
+        past->type != GGML_TYPE_F32 || past->nb[0] != sizeof(float) ||
+        get_misalign_bytes(ctx, past) != 0 || get_misalign_bytes(ctx, store) != 0) {
+        return false;
+    }
+    if (store->op == GGML_OP_CPY) {
+        return src->view_offs == x->view_offs + n_t*x->nb[0] && src->ne[0] == n_cols && ggml_are_same_stride(src, x) &&
+               store->ne[0] == n_cols*x->ne[1] && store->ne[1] == x->ne[2] && ggml_nrows(store) == x->ne[2];
+    }
+    // src [n_cols, n_slots, channel, seq] holds windows one column apart, the last one the last n_cols columns of x,
+    // and store [n_cols, slot, channel, seq] the cells
+    const ggml_tensor * idx     = store->src[1];
+    const int64_t       n_slots = src->ne[1];
+    *slot_idx = idx;
+    return n_slots >= 1 && n_slots <= n_t && src->view_offs == x->view_offs + (n_t - n_slots + 1)*x->nb[0] &&
+           src->ne[0] == n_cols && src->ne[2] == x->ne[1] && src->ne[3] == x->ne[2] &&
+           src->nb[0] == x->nb[0] && src->nb[1] == x->nb[0] && src->nb[2] == x->nb[1] && src->nb[3] == x->nb[2] &&
+           store->ne[0] == n_cols && store->ne[2] == x->ne[1] && store->ne[3] == x->ne[2] && store->nb[2] == n_cols*sizeof(float) &&
+           idx->type == GGML_TYPE_I32 && ggml_is_contiguous(idx) && ggml_nelements(idx) == n_slots && get_misalign_bytes(ctx, idx) == 0;
+}
+
+// Finds the short convolutions of this graph that run as one dispatch with their CONCAT and their state store,
 // and the nodes that dispatch then replaces: at the SSM_CONV when the conv ends in ssm_conv_res_pattern, at the
 // SCALE when it has dynamic taps. Only convs that graph_optimize marked qualify, as only for those the allocator
 // keeps what the dispatch reads alive through its output.
@@ -16272,14 +16307,7 @@ static void ggml_vk_find_conv_states(ggml_backend_vk_context * ctx, const struct
         return;
     }
 
-    // the state store: cpy(view of x, cell of the state cache), by x
-    std::unordered_map<const ggml_tensor *, const ggml_tensor *> stores;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (node->op == GGML_OP_CPY && node->src[0]->op == GGML_OP_VIEW && node->src[0]->src[0]->op == GGML_OP_CONCAT) {
-            stores[node->src[0]->src[0]] = node;
-        }
-    }
+    const auto stores = ggml_vk_conv_stores(cgraph);
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -16293,7 +16321,8 @@ static void ggml_vk_find_conv_states(ggml_backend_vk_context * ctx, const struct
             x = x && ggml_get_op_params_i32(chain.conv, 0) == 2 ? x : nullptr;
         }
         auto it = x ? stores.find(x) : stores.end();
-        if (it == stores.end() || !ggml_vk_conv_store_ok(ctx, cgraph, x, it->second)) {
+        const ggml_tensor * slot_idx = nullptr;
+        if (it == stores.end() || !ggml_vk_conv_store_ok(ctx, cgraph, x, it->second, &slot_idx)) {
             continue;
         }
 
@@ -16324,15 +16353,16 @@ static void ggml_vk_find_conv_states(ggml_backend_vk_context * ctx, const struct
         // the shader reads cur across tokens, and writes the cell while it reads everything else
         bool overlap = ggml_vk_tensors_overlap(past, dst, false) || ggml_vk_tensors_overlap(conv->src[1], dst, false) ||
                        ggml_vk_tensors_overlap(cur, dst, n_t == 1) || (skip && ggml_vk_tensors_overlap(skip, dst, true)) ||
-                       (chain.taps && ggml_vk_tensors_overlap(chain.taps, dst, false));
-        for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ past, conv->src[1], cur, dst, skip, chain.taps }) {
+                       (chain.taps && ggml_vk_tensors_overlap(chain.taps, dst, false)) ||
+                       (slot_idx && ggml_vk_tensors_overlap(slot_idx, dst, false));
+        for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ past, conv->src[1], cur, dst, skip, chain.taps, slot_idx }) {
             overlap = overlap || (t && ggml_vk_tensors_overlap(t, store, false));
         }
         if (overlap) {
             continue;
         }
 
-        ctx->conv_states[node] = { conv, past, cur, store, chain.taps };
+        ctx->conv_states[node] = { conv, past, cur, store, chain.taps, slot_idx };
         ctx->conv_state_skip.insert(x);
         ctx->conv_state_skip.insert(store);
         if (chain.taps) {
@@ -17571,12 +17601,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     // A short convolution may read its past where the CONCAT read it, and with dynamic taps it runs at its SCALE
     // (ggml_vk_find_conv_states). Keep what it reads alive through the fused output, and mark the SSM_CONV in its
-    // unused op params to say so: 1 for a conv that ends in ssm_conv_res_pattern, 2 for one with dynamic taps
+    // unused op params to say so: 1 for a conv that ends in ssm_conv_res_pattern, 2 for one with dynamic taps.
+    // A SET_ROWS state store also reads its slot order there
+    const auto stores = ggml_vk_conv_stores(graph);
+    auto const &keep_slot_idx = [&](const ggml_tensor * x, ggml_tensor * last) {
+        auto it = stores.find(x);
+        if (it != stores.end() && it->second->op == GGML_OP_SET_ROWS) {
+            params->add_alloc_dep(params->user_data, it->second->src[1], last);
+        }
+    };
     for (int i = 0; i < graph->n_nodes; ++i) {
         vk_conv_dynamic_chain chain {};
         if (const ggml_tensor * x = ggml_vk_conv_state_concat(graph, i)) {
             const int last = i + 3 + ggml_can_fuse_subgraph(graph, i, ssm_conv_res_skip_pattern, { i + 4 });
             params->add_alloc_dep(params->user_data, x->src[0], graph->nodes[last]);
+            keep_slot_idx(x, graph->nodes[last]);
             // over several tokens the fused op reads cur across tokens, so its output must not take cur's place.
             // One token reads only its own element, and those graphs keep their allocation
             if (graph->nodes[i]->ne[1] > 1) {
@@ -17588,6 +17627,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             for (ggml_tensor * t : { x->src[0], chain.cur, chain.taps }) {
                 params->add_alloc_dep(params->user_data, t, graph->nodes[i]);
             }
+            keep_slot_idx(x, graph->nodes[i]);
             ggml_set_op_params_i32(chain.conv, 0, 2);
         }
     }

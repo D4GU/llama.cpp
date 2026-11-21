@@ -14,7 +14,9 @@ layout(constant_id = 4) const bool APPLY_RESIDUAL = false;
 // skip + that, the residual ADD of the layer right after the convolution
 layout(constant_id = 5) const bool APPLY_SKIP = false;
 // x = concat(past, cur^T) is not materialized: src0 holds its first nc - 1 columns, the past, and res, which
-// is cur, the rest. The last token also writes the last nc - 1 columns of x to the state cache, as the CPY did
+// is cur, the rest. The last token also writes the last nc - 1 columns of x to the state cache, as the CPY did.
+// With rollback slots each of the last n_slots tokens writes the nc - 1 columns after it to the slot that
+// slot_idx names for its window, as the SET_ROWS did
 layout(constant_id = 6) const bool READ_STATE = false;
 // then adds window * tap for each lag, x shifted by nc - 1 - lag times the tap of the channel's head
 layout(constant_id = 7) const bool DYNAMIC_TAPS = false;
@@ -33,6 +35,7 @@ layout(binding = 3) buffer Dst { float dst[]; };
 layout(binding = 4) readonly buffer Skip { float skip[]; };
 layout(binding = 5) writeonly buffer State { float state[]; };
 layout(binding = 6) readonly buffer Taps { float taps[]; };
+layout(binding = 7) readonly buffer SlotIdx { int slot_idx[]; };
 #endif
 
 layout(push_constant) uniform PushConstants {
@@ -44,6 +47,7 @@ layout(push_constant) uniform PushConstants {
 #if FUSED
     uint state_nb1;
     uint head_size; uint taps_nb1;
+    uint n_slots; uint slot_stride;
 #endif
 };
 
@@ -105,9 +109,10 @@ void main() {
         }
     }
     // before the dst store, which may alias res when there is one token
-    if (READ_STATE && i2 == n_t - 1) {
+    if (READ_STATE && i2 + n_slots >= n_t) {
+        const uint slot_base = slot_stride == 0 ? 0 : uint(slot_idx[i2 + n_slots - n_t]) * slot_stride;
         for (uint i0 = 1; i0 < nc; i0++) {
-            state[i3 * state_nb1 + i1 * (nc - 1) + i0 - 1] = LOAD_X(src0_base + i0);
+            state[slot_base + i3 * state_nb1 + i1 * (nc - 1) + i0 - 1] = LOAD_X(src0_base + i0);
         }
     }
 #endif
