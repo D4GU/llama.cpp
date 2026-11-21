@@ -4295,7 +4295,9 @@ void llm_graph_context::build_conv_state_store(
     const size_t row_size  = s->nb[1];
     const size_t cell_offs = mctx_cur->get_head()*row_size + offs;
 
-    if (cparams.n_rs_seq == 0) {
+    // with one token per sequence no rollback is possible (rs_max is 0) and the snapshot path below would write
+    // only slot 0, the cell itself, so the plain copy stores the same bytes
+    if (cparams.n_rs_seq == 0 || n == 1) {
         ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
                 n_cols, channels, n_seqs,
                 conv_x->nb[1], conv_x->nb[2],
