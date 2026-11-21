@@ -330,6 +330,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // the messages make the Q, K and V inputs of a SWA layer differ
         for (int j = 0; j < 3; ++j) {
             inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
+            // Vulkan sums the squares of a one-row RMS_NORM inside the ADD right before it, which rounds differently.
+            // The original node order gave that path only to the full-attention Q input. Reading the others
+            // through a view keeps them off it in any node order, so the output stays bit-identical
+            if (is_swa || j != 0) {
+                inputs[j] = ggml_reshape_2d(ctx0, inputs[j], n_embd, n_tokens);
+            }
         }
     }
 
