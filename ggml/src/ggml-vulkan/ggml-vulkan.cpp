@@ -4290,7 +4290,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_f32,       "ssm_conv_res_f32",       ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_f32[0],    "ssm_conv_res_f32",       ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1, 0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_f32[1],    "ssm_conv_res_skip_f32",  ssm_conv_fused_f32_len, ssm_conv_fused_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11631,16 +11632,20 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     });
 }
 
-// node_idx is the SSM_CONV, the start of ssm_conv_res_pattern
+// node_idx is the SSM_CONV, the start of ssm_conv_res_pattern, or of ssm_conv_res_skip_pattern with one more fused op
 static void ggml_vk_ssm_conv_res(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * conv = cgraph->nodes[node_idx];
-    const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
-    ggml_tensor *       dst  = cgraph->nodes[node_idx + 3];
-    const ggml_tensor * src0 = conv->src[0];
-    const ggml_tensor * src1 = conv->src[1];
-    const ggml_tensor * res  = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
+    const bool          with_skip = ctx->num_additional_fused_ops == (int) ssm_conv_res_skip_pattern.size() - 1;
+    const ggml_tensor * conv  = cgraph->nodes[node_idx];
+    const ggml_tensor * add   = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 3];
+    ggml_tensor *       dst   = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    const ggml_tensor * src0  = conv->src[0];
+    const ggml_tensor * src1  = conv->src[1];
+    const ggml_tensor * res   = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
+    // without the skip, dst fills the unused binding
+    const ggml_tensor * skip  = !with_skip ? dst : dst->src[0] == scale ? dst->src[1] : dst->src[0];
 
-    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_res_f32;
+    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_res_f32[with_skip];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     // dst is contiguous with the shape of the conv output, so the conv strides address it per sequence
@@ -11653,12 +11658,13 @@ static void ggml_vk_ssm_conv_res(ggml_backend_vk_context * ctx, vk_context& subc
         (uint32_t)src0->ne[1],
         (uint32_t)conv->ne[1],
         (uint32_t)conv->ne[2],
-        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
+        ggml_get_op_params_f32(scale, 0), ggml_get_op_params_f32(scale, 1),
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
         ggml_vk_tensor_subbuffer(ctx, src0, true), ggml_vk_tensor_subbuffer(ctx, src1, true),
         ggml_vk_tensor_subbuffer(ctx, res, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
+        ggml_vk_tensor_subbuffer(ctx, skip, true),
     }, pc, { (uint32_t)src0->ne[1], (uint32_t)conv->ne[1], (uint32_t)conv->ne[2] });
 }
 
@@ -15863,6 +15869,27 @@ static bool ggml_vk_can_fuse_attn_rel_bias(const struct ggml_cgraph * cgraph, in
     return true;
 }
 
+// whether the node after an ssm_conv_res_pattern match is the residual ADD of the layer, which the shader adds last
+static bool ggml_vk_can_fuse_ssm_conv_skip(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ssm_conv_res_skip_pattern, { node_idx + 4 })) {
+        return false;
+    }
+
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * add   = cgraph->nodes[node_idx + 4];
+    if ((add->src[0] == scale) == (add->src[1] == scale)) {
+        return false;
+    }
+    const ggml_tensor * skip = add->src[0] == scale ? add->src[1] : add->src[0];
+
+    if (skip->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(skip, add) || !ggml_are_same_shape(scale, add) ||
+        !ggml_is_contiguous(skip) || !ggml_is_contiguous(add)) {
+        return false;
+    }
+    return get_misalign_bytes(ctx, skip) == 0 && get_misalign_bytes(ctx, add) == 0;
+}
+
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
     ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
     vk_buffer a_buf = a_buf_ctx->dev_buffer;
@@ -16302,14 +16329,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // the transposed write crosses rows, and the cur row lands at another row index
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_ssm_conv_res(ctx, cgraph, i)) {
-                ctx->num_additional_fused_ops = ssm_conv_res_pattern.size() - 1;
+                const bool with_skip = ggml_vk_can_fuse_ssm_conv_skip(ctx, cgraph, i);
+                ctx->num_additional_fused_ops = (with_skip ? ssm_conv_res_skip_pattern : ssm_conv_res_pattern).size() - 1;
                 ctx->fused_ssm_conv_res = true;
-                fusion_string = "SSM_CONV_RES";
-                // the conv reads several tokens per output; each thread reads the residual where it writes
+                fusion_string = with_skip ? "SSM_CONV_RES_SKIP" : "SSM_CONV_RES";
+                // the conv reads several tokens per output; each thread reads the residuals where it writes
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
                 op_srcs_fused_elementwise[3] = true;
+                op_srcs_fused_elementwise[4] = true;
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";

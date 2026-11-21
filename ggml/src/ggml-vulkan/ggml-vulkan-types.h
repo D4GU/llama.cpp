@@ -656,6 +656,9 @@ static constexpr std::initializer_list<std::array<int, 3>> ssm_conv_res_edges {
     { 3, 0, 2 }, // scale->src[0]   == add
 };
 
+// the same, then the residual ADD of the layer, skip + that; the ADD takes the SCALE as either src
+static constexpr std::initializer_list<ggml_op> ssm_conv_res_skip_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD };
+
 // the depth states of Inkling 2 mix(): rms_norm(concat(stack, cur, 1)) and its transposed copy
 static constexpr std::initializer_list<ggml_op> mix_norm_pattern { GGML_OP_CONCAT, GGML_OP_RMS_NORM, GGML_OP_TRANSPOSE, GGML_OP_CONT };
 
@@ -1133,7 +1136,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
-    vk_pipeline pipeline_ssm_conv_res_f32;
+    vk_pipeline pipeline_ssm_conv_res_f32[2]; // [with skip]
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
