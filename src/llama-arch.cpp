@@ -1349,7 +1349,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_JOINT_PROJ,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_DSPARK_MASK_EMBD,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    // on the drafter's device: a host copy splits the draft block graph around the CPU op that reads it
+    {LLM_TENSOR_DSPARK_MASK_EMBD,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DSPARK_FUSE,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DSPARK_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DSPARK_HIDDEN_OUT,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
