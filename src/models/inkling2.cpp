@@ -321,10 +321,11 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
 
     ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
     ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
-    // the message and both matmuls ahead of the elementwise tail, so that the tail is one contiguous chain a backend can fuse
+    // the message and both matmuls ahead of the elementwise tail, so that the tail is one contiguous chain a backend can fuse.
+    // gain first, as its weight is loaded first: outputs allocated in the order of the weights let Vulkan run both in one dispatch
     ggml_build_forward_expand(gf, message);
-    ggml_build_forward_expand(gf, forget);
     ggml_build_forward_expand(gf, gain);
+    ggml_build_forward_expand(gf, forget);
     gain   = ggml_tanh(ctx0, gain);
     forget = ggml_tanh(ctx0, forget);
 
