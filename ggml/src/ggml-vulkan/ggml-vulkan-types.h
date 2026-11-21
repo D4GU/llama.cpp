@@ -608,6 +608,19 @@ static constexpr std::initializer_list<std::array<int, 3>> situ_edges {
     { 12, 1, 11 }, // mul->src[1]     == up scale
 };
 
+// Inkling 2 loop controller tail x - tanh(f)*x + tanh(g)*m, with f and g matmul outputs
+static constexpr std::initializer_list<ggml_op> loop_ctrl_pattern { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+                                                                    GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+
+// relative to the forget TANH node
+static constexpr std::initializer_list<std::array<int, 3>> loop_ctrl_edges {
+    { 1, 0, 0 }, // mul->src[0] == forget tanh
+    { 2, 1, 1 }, // sub->src[1] == forget mul
+    { 4, 0, 3 }, // mul->src[0] == gain tanh
+    { 5, 0, 2 }, // add->src[0] == sub
+    { 5, 1, 4 }, // add->src[1] == gain mul
+};
+
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
@@ -984,6 +997,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_l2_norm_f32;
     vk_pipeline pipeline_l2_clip_f32[2]; // [with leading MUL]
     vk_pipeline pipeline_situ_f32;
+    vk_pipeline pipeline_loop_ctrl_f32;
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_unary[GGML_UNARY_OP_COUNT][3];
@@ -1417,6 +1431,7 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     bool fused_l2_clip {};
     bool fused_situ {};
+    bool fused_loop_ctrl {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
