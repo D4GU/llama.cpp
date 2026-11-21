@@ -385,6 +385,8 @@ struct vk_queue {
 };
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// rows per workgroup of the mat-vec that computes the softmax of its B: each workgroup recomputes it once
+static constexpr uint32_t mul_mat_vec_soft_max_rows = 8;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
@@ -1015,6 +1017,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    // the F32 mat-vec of DMMV_WG_SIZE_SUBGROUP with the SOFT_MAX of its src1, by number of columns
+    vk_pipeline pipeline_mul_mat_vec_soft_max_f32[mul_mat_vec_max_cols];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1539,6 +1543,7 @@ struct ggml_backend_vk_context {
     bool fused_attn_rel_bias {};
     bool fused_moe_router {};
     bool fused_mul_mat_vec_pair {};
+    bool fused_mul_mat_vec_soft_max {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // short convolutions that read their past and write their state cache in place of the CONCAT and CPY

@@ -61,6 +61,17 @@ struct vk_mat_vec_push_constants {
     uint32_t broadcast3;
 };
 
+// mul_mat_vec.comp with SOFT_MAX_B: the mat-vec, then the soft_max.comp parameters of the B rows
+struct vk_mat_vec_soft_max_push_constants {
+    vk_mat_vec_push_constants mv;
+    float scale;
+    float max_bias;
+    uint32_t ky;
+    uint32_t has_sinks;
+};
+
+static_assert(sizeof(vk_mat_vec_soft_max_push_constants) <= 128);
+
 struct vk_mat_vec_p021_push_constants {
     uint32_t ncols_x;
     uint32_t nrows_x;

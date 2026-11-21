@@ -38,6 +38,12 @@ layout (push_constant) uniform parameter
     uint broadcast2;
     uint broadcast3;
 #endif
+#ifdef SOFT_MAX_B
+    float sm_scale;
+    float sm_max_bias;
+    uint sm_ky;
+    uint sm_has_sinks;
+#endif
 } p;
 
 #ifdef MUL_MAT_ID
