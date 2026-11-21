@@ -15694,10 +15694,8 @@ bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const str
     const ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
 
     // The RMS kernel reads F32 and writes directly to the SET_ROWS destination.
-    // F16 destinations stay unfused: on Inkling 2 Mini the fused F16 write moved top-token probabilities
-    // by up to 0.05 against both the unfused path and an F32 cache, which agree with each other. Cause not traced.
     if (rms->src[0]->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||
-        set_rows->type != GGML_TYPE_F32 ||
+        (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) ||
         set_rows->src[1]->type != GGML_TYPE_I64 || !ggml_is_contiguous(set_rows->src[1]) ||
         set_rows->nb[0] != ggml_type_size(set_rows->type) || get_misalign_bytes(ctx, set_rows->src[1]) != 0) {
         return false;
@@ -17189,8 +17187,51 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        // Look for ROPE/RMS_NORM + VIEW + SET_ROWS and make them consecutive
+        auto const &pull_view_set_rows = [&](int idx) {
+            if (graph->nodes[idx]->op != GGML_OP_ROPE && graph->nodes[idx]->op != GGML_OP_RMS_NORM) {
+                return;
+            }
+            int view_idx = -1;
+            int set_rows_idx = -1;
+            for (int k = idx + 1; k < std::min(idx + 15, graph->n_nodes); ++k) {
+                if (used[k]) {
+                    continue;
+                }
+                if (view_idx == -1 && graph->nodes[k]->op == GGML_OP_VIEW && graph->nodes[k]->src[0] == graph->nodes[idx]) {
+                    view_idx = k;
+                    continue;
+                }
+                if (view_idx != -1 && graph->nodes[k]->op == GGML_OP_SET_ROWS && graph->nodes[k]->src[0] == graph->nodes[view_idx]) {
+                    set_rows_idx = k;
+                    break;
+                }
+            }
+            if (set_rows_idx == -1) {
+                return;
+            }
+            const int node_idxs[] = { idx, view_idx, set_rows_idx };
+            const ggml_op ops[] = { graph->nodes[idx]->op, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+            bool can_pull = ggml_can_fuse_subgraph_ext(graph, node_idxs, 3, ops, &set_rows_idx, 1);
+
+            for (int c = idx + 1; can_pull && c < set_rows_idx; ++c) {
+                if (!used[c] && c != view_idx && !is_empty(graph->nodes[c]) &&
+                    is_src_of(graph->nodes[set_rows_idx], graph->nodes[c])) {
+                    can_pull = false;
+                }
+            }
+
+            if (can_pull) {
+                current_set.push_back(view_idx);
+                current_set.push_back(set_rows_idx);
+                used[view_idx] = true;
+                used[set_rows_idx] = true;
+            }
+        };
+
         // First, grab the next unused node.
         current_set.push_back(first_unused);
+        pull_view_set_rows(first_unused);
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
@@ -17272,43 +17313,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         }
                     }
                 }
-                // Look for ROPE/RMS_NORM + VIEW + SET_ROWS and make them consecutive
-                if (graph->nodes[rope_idx]->op == GGML_OP_ROPE || graph->nodes[rope_idx]->op == GGML_OP_RMS_NORM) {
-                    int view_idx = -1;
-                    int set_rows_idx = -1;
-                    for (int k = rope_idx + 1; k < std::min(rope_idx + 15, graph->n_nodes); ++k) {
-                        if (used[k]) {
-                            continue;
-                        }
-                        if (view_idx == -1 && graph->nodes[k]->op == GGML_OP_VIEW && graph->nodes[k]->src[0] == graph->nodes[rope_idx]) {
-                            view_idx = k;
-                            continue;
-                        }
-                        if (view_idx != -1 && graph->nodes[k]->op == GGML_OP_SET_ROWS && graph->nodes[k]->src[0] == graph->nodes[view_idx]) {
-                            set_rows_idx = k;
-                            break;
-                        }
-                    }
-                    if (set_rows_idx != -1) {
-                        const int node_idxs[] = { rope_idx, view_idx, set_rows_idx };
-                        const ggml_op ops[] = { graph->nodes[rope_idx]->op, GGML_OP_VIEW, GGML_OP_SET_ROWS };
-                        bool can_pull = ggml_can_fuse_subgraph_ext(graph, node_idxs, 3, ops, &set_rows_idx, 1);
-
-                        for (int c = rope_idx + 1; can_pull && c < set_rows_idx; ++c) {
-                            if (!used[c] && c != view_idx && !is_empty(graph->nodes[c]) &&
-                                is_src_of(graph->nodes[set_rows_idx], graph->nodes[c])) {
-                                can_pull = false;
-                            }
-                        }
-
-                        if (can_pull) {
-                            current_set.push_back(view_idx);
-                            current_set.push_back(set_rows_idx);
-                            used[view_idx] = true;
-                            used[set_rows_idx] = true;
-                        }
-                    }
-                }
+                pull_view_set_rows(rope_idx);
                 // Look for MUL_MAT_ID + ADD_ID + MUL
                 if (j > 0 &&
                     graph->nodes[j]->op == GGML_OP_ADD_ID &&
