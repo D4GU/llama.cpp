@@ -72,6 +72,13 @@ struct vk_mat_vec_soft_max_push_constants {
 
 static_assert(sizeof(vk_mat_vec_soft_max_push_constants) <= 128);
 
+// mul_mat_vec.comp with PAIR: batch 1 reads the second matrix and writes the second output, both read the same B
+struct vk_mat_vec_pair_push_constants {
+    vk_mat_vec_push_constants mv;
+    uint32_t pair_stride_a;
+    uint32_t pair_stride_d;
+};
+
 struct vk_mat_vec_p021_push_constants {
     uint32_t ncols_x;
     uint32_t nrows_x;

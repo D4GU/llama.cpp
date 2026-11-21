@@ -44,6 +44,10 @@ layout (push_constant) uniform parameter
     uint sm_ky;
     uint sm_has_sinks;
 #endif
+#ifdef PAIR
+    uint pair_stride_a;
+    uint pair_stride_d;
+#endif
 } p;
 
 #ifdef MUL_MAT_ID
@@ -78,18 +82,24 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     a_offset =
 #ifdef MUL_MAT_ID
             expert_id * (p.batch_stride_a / QUANT_K);
+#elif defined(PAIR)
+            batch_idx * (p.pair_stride_a / QUANT_K);
 #else
             batch_idx_a * (p.batch_stride_a / QUANT_K);
 #endif
     b_offset =
 #ifdef MUL_MAT_ID
             (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+#elif defined(PAIR)
+            0;
 #else
             batch_idx * p.batch_stride_b;
 #endif
     d_offset =
 #ifdef MUL_MAT_ID
             expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+#elif defined(PAIR)
+            batch_idx * p.pair_stride_d;
 #else
             batch_idx * p.batch_stride_d;
 #endif

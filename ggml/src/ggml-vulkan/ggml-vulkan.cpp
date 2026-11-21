@@ -3322,6 +3322,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         mul_mat_vec_soft_max_f32_f32_data, mul_mat_vec_soft_max_f32_f32_subgroup_data, mul_mat_vec_soft_max_f32_f32_subgroup_no_shmem_data };
     const uint64_t mul_mat_vec_soft_max_len[SHADER_REDUCTION_MODE_COUNT] = {
         mul_mat_vec_soft_max_f32_f32_len, mul_mat_vec_soft_max_f32_f32_subgroup_len, mul_mat_vec_soft_max_f32_f32_subgroup_no_shmem_len };
+    const void * const mul_mat_vec_pair_data[SHADER_REDUCTION_MODE_COUNT] = {
+        mul_mat_vec_pair_f32_f32_data, mul_mat_vec_pair_f32_f32_subgroup_data, mul_mat_vec_pair_f32_f32_subgroup_no_shmem_data };
+    const uint64_t mul_mat_vec_pair_len[SHADER_REDUCTION_MODE_COUNT] = {
+        mul_mat_vec_pair_f32_f32_len, mul_mat_vec_pair_f32_f32_subgroup_len, mul_mat_vec_pair_f32_f32_subgroup_no_shmem_len };
 
     for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
         const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
@@ -3337,6 +3341,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_pair_f32[w][i], "mul_mat_vec_pair_f32_f32", mul_mat_vec_pair_len[reduc], mul_mat_vec_pair_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_pair_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             // the same mat-vec over more rows, whose softmax of B runs on as many threads as SOFT_MAX does
             if (w == DMMV_WG_SIZE_SUBGROUP && wg_size_subgroup == device->subgroup_size) {
                 const uint32_t rows = mul_mat_vec_soft_max_rows;
@@ -8234,10 +8239,11 @@ void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_
         { (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], (uint32_t)dst->ne[3] });
 }
 
-// Two single-column MUL_MATs of equally shaped F32 weights with the same src1, such as the forget and gain
+// Two mat-vec MUL_MATs of equally shaped F32 weights with the same src1, such as the forget and gain
 // projections of an Inkling 2 loop controller. When both weights lie in one buffer and both outputs in one
 // buffer, in the same order, the unchanged mat-vec pipeline computes both as two batches whose strides
-// reach from the first weight and output to the second
+// reach from the first weight and output to the second. With several columns those strides hold the
+// column strides, so the PAIR variant of the pipeline takes the batch strides apart
 struct vk_mul_mat_vec_pair {
     vk_subbuffer a, d;           // from the first weight and output through the second
     uint32_t stride_a, stride_d; // in floats
@@ -8253,8 +8259,8 @@ static bool ggml_vk_get_mul_mat_vec_pair(const ggml_backend_vk_context * ctx, co
         return false;
     }
     const ggml_tensor * b = mm[0]->src[1];
-    if (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || b->ne[1] != 1 || b->ne[2] != 1 || b->ne[3] != 1 ||
-        get_misalign_bytes(ctx, b) != 0) {
+    if (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || b->ne[1] > ggml_vk_mul_mat_vec_max_cols(ctx->device) ||
+        b->ne[2] != 1 || b->ne[3] != 1 || get_misalign_bytes(ctx, b) != 0) {
         return false;
     }
     for (const ggml_tensor * t : mm) {
@@ -8301,18 +8307,42 @@ static void ggml_vk_mul_mat_vec_pair(ggml_backend_vk_context * ctx, vk_context& 
     const ggml_tensor * mm = cgraph->nodes[node_idx];
     const uint32_t k = (uint32_t)mm->src[0]->ne[0];
     const uint32_t m = (uint32_t)mm->src[0]->ne[1];
+    const uint32_t n = (uint32_t)mm->src[1]->ne[1];
+    const vk_subbuffer b = ggml_vk_tensor_subbuffer(ctx, mm->src[1]);
 
     // the pipeline and push constants of ggml_vk_mul_mat_vec_q_f16 for one of the two, with a batch of two:
     // batch 1 reads the second weight and writes the second output, both read the same src1
-    vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, GGML_TYPE_F32, GGML_TYPE_F32, 1, m, k);
-    ggml_pipeline_request_descriptor_sets(ctx, dmmv, 1);
-    const vk_mat_vec_push_constants pc = {
-        k, k, k, m,
-        pair.stride_a, 0, pair.stride_d,
-        0, 0,
-        2, 2, 1, 1,
+    vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, GGML_TYPE_F32, GGML_TYPE_F32, n, m, k);
+    if (n == 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, dmmv, 1);
+        const vk_mat_vec_push_constants pc = {
+            k, k, k, m,
+            pair.stride_a, 0, pair.stride_d,
+            0, 0,
+            2, 2, 1, 1,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv, { pair.a, b, pair.d, pair.d, pair.d }, pc, { m, 2, 1 });
+        return;
+    }
+    // with n columns the batch strides hold the column strides, as ggml_vk_mul_mat_vec_q_f16 sets them, so the PAIR
+    // variant of that pipeline, of its workgroup size, reads the pair strides from push constants of their own
+    uint32_t w = 0;
+    while (ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32][n - 1] != dmmv) {
+        w++;
+        GGML_ASSERT(w < DMMV_WG_SIZE_COUNT);
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_pair_f32[w][n - 1];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_mat_vec_pair_push_constants pc = {
+        {
+            k, k, k, m,
+            0, k, m,
+            0, 0,
+            1, 1, 1, 1,
+        },
+        pair.stride_a, pair.stride_d,
     };
-    ggml_vk_dispatch_pipeline(ctx, subctx, dmmv, { pair.a, ggml_vk_tensor_subbuffer(ctx, mm->src[1]), pair.d, pair.d, pair.d }, pc, { m, 2, 1 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { pair.a, b, pair.d, pair.d, pair.d }, pc, { m, 2, 1 });
 }
 
 // A SOFT_MAX that only an F32 mat-vec reads, such as the output mat-vec of an Inkling 2 depth mix. Every

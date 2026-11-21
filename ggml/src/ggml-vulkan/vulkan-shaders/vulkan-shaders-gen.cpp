@@ -810,6 +810,11 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_soft_max_f32_f32", shader, soft_max_dict);
             string_to_spv("mul_mat_vec_soft_max_f32_f32_subgroup", shader, merge_maps(soft_max_dict, {{"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_soft_max_f32_f32_subgroup_no_shmem", shader, merge_maps(soft_max_dict, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+
+            const std::map<std::string, std::string> pair_dict = merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"PAIR", "1"}});
+            string_to_spv("mul_mat_vec_pair_f32_f32", shader, pair_dict);
+            string_to_spv("mul_mat_vec_pair_f32_f32_subgroup", shader, merge_maps(pair_dict, {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_pair_f32_f32_subgroup_no_shmem", shader, merge_maps(pair_dict, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)

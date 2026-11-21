@@ -1021,6 +1021,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
     // the F32 mat-vec of DMMV_WG_SIZE_SUBGROUP with the SOFT_MAX of its src1, by number of columns
     vk_pipeline pipeline_mul_mat_vec_soft_max_f32[mul_mat_vec_max_cols];
+    // the F32 mat-vec of two matrices and outputs with one src1, by workgroup size and number of columns
+    vk_pipeline pipeline_mul_mat_vec_pair_f32[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
