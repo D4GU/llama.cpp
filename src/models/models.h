@@ -2554,6 +2554,8 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // zero attention sinks by head count, filled once per graph
         std::map<int64_t, ggml_tensor *> zero_sinks;
+        // the Q, K and V controllers of a SWA layer share one input, so its norm is built once
+        std::map<ggml_tensor *, ggml_tensor *> norms;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
