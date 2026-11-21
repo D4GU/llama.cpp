@@ -939,6 +939,8 @@ struct llama_model {
     struct ggml_tensor * dspark_norm         = nullptr;
     struct ggml_tensor * dspark_hidden_out   = nullptr;
     struct ggml_tensor * dspark_hidden_out_b = nullptr;
+    struct ggml_tensor * dspark_hidden_out_lm   = nullptr; // target LM head times dspark_hidden_out, optional
+    struct ggml_tensor * dspark_hidden_out_lm_b = nullptr;
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;

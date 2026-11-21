@@ -193,6 +193,9 @@ void llama_model_dflash::load_tensors_inkling2_head() {
     dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"),   {3*rank}, 0);
     dspark_hidden_out   = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "weight"), {rank, n_embd}, 0);
     dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "bias"),   {n_embd}, 0);
+    dspark_hidden_out_lm   = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT_LM, "weight"), {rank, hparams.n_vocab_padded}, TENSOR_NOT_REQUIRED);
+    dspark_hidden_out_lm_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT_LM, "bias"),   {hparams.n_vocab_padded},
+                                           dspark_hidden_out_lm ? 0 : TENSOR_NOT_REQUIRED);
     for (int il = 0; il < n_layer; ++il) {
         auto & layer = layers[il];
         layer.dflare_norm     = create_tensor(tn(LLM_TENSOR_DFLARE_NORM,     "weight", il), {n_embd}, 0);
@@ -261,8 +264,17 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
     auto * prev_embd = ggml_get_rows(g.ctx0, model.dspark_markov_w1, prev);
     ggml_set_name(prev_embd, "dspark_prev_embd");
     auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
-    auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    auto * logits = ggml_add(g.ctx0, base, inkling2_lm_head(g, model, correction));
+    ggml_tensor * bias;
+    if (model.dspark_hidden_out_lm) {
+        // W (Hout latent + b) = (W Hout) latent + W b reads a rank-wide matrix instead of the whole LM head
+        bias = g.build_lora_mm(model.dspark_hidden_out_lm, latent);
+        ggml_prec_set_acc(bias, GGML_PREC_F32);
+        bias = ggml_add(g.ctx0, bias, model.dspark_hidden_out_lm_b);
+    } else {
+        auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        bias = inkling2_lm_head(g, model, correction);
+    }
+    auto * logits = ggml_add(g.ctx0, base, bias);
     logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, base->ne[1], logits->nb[1], 0));
     const float cap = model.hparams.f_final_logit_softcapping;
     return ggml_scale(g.ctx0, ggml_tanh(g.ctx0, ggml_scale(g.ctx0, logits, 1.0f/cap)), cap);
