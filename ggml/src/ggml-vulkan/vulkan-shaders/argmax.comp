@@ -6,55 +6,107 @@
 #extension GL_EXT_control_flow_attributes : enable
 
 #define FLT_MAX 3.402823466e+38F
+#define UNROLL 8
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+// The result is defined by BLOCK_SIZE strided scans (scan c reads elements c, c + BLOCK_SIZE, ...) joined by the
+// tree below, which fixes the tie and NaN behaviour. A wider workgroup splits each scan into WG_SIZE / BLOCK_SIZE
+// runs of consecutive rows and joins the runs in order, which returns what the single scan returns.
+layout (constant_id = 0) const uint WG_SIZE = 32;
+layout (constant_id = 1) const uint BLOCK_SIZE = 32;
 
-shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
-shared uint tmp[BLOCK_SIZE];
+shared FLOAT_TYPE tmpmax[WG_SIZE];
+shared uint tmp[WG_SIZE];
 
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint col = gl_LocalInvocationID.x;
+    const uint lid = gl_LocalInvocationID.x;
+    const uint col = lid % BLOCK_SIZE;
+    const uint part = lid / BLOCK_SIZE;
+    const uint n_parts = WG_SIZE / BLOCK_SIZE;
 
     if (row >= p.KY) {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
-    uint acol = col;
+    const uint n_rows = (p.KX + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint rows_per_part = (n_rows + n_parts - 1) / n_parts;
+    const uint r_end = min((part + 1) * rows_per_part, n_rows);
+    uint r = part * rows_per_part;
 
-    if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
+    A_TYPE amax;
+    uint acol;
+    if (part == 0) {
+        amax = -FLT_MAX;
+        acol = col;
+        if (col < p.KX) {
+            amax = data_a[row*p.KX + col];
+        }
+        r = 1;
+    } else {
+        // -inf never wins a strict comparison, so an all -inf or all NaN run leaves the scan unchanged
+        amax = uintBitsToFloat(0xFF800000u);
+        acol = 0;
     }
 
-    for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
-        if (val > amax) {
-            amax = val;
-            acol = i;
+    // loads first so several are in flight, then the compares in scan order
+    const uint r_full = min(r_end, p.KX / BLOCK_SIZE);
+    for (; r + UNROLL <= r_full; r += UNROLL) {
+        A_TYPE vals[UNROLL];
+        [[unroll]] for (uint k = 0; k < UNROLL; ++k) {
+            vals[k] = data_a[row*p.KX + (r + k) * BLOCK_SIZE + col];
+        }
+        [[unroll]] for (uint k = 0; k < UNROLL; ++k) {
+            if (vals[k] > amax) {
+                amax = vals[k];
+                acol = (r + k) * BLOCK_SIZE + col;
+            }
         }
     }
 
-    tmp[col] = acol;
-    tmpmax[col] = amax;
+    for (; r < r_end; ++r) {
+        const uint i = r * BLOCK_SIZE + col;
+        if (i < p.KX) {
+            A_TYPE val = data_a[row*p.KX + i];
+            if (val > amax) {
+                amax = val;
+                acol = i;
+            }
+        }
+    }
 
+    tmpmax[lid] = amax;
+    tmp[lid] = acol;
     barrier();
+
+    if (part == 0) {
+        for (uint j = 1; j < n_parts; ++j) {
+            const FLOAT_TYPE val = tmpmax[j * BLOCK_SIZE + col];
+            if (val > amax) {
+                amax = val;
+                acol = tmp[j * BLOCK_SIZE + col];
+            }
+        }
+        tmpmax[col] = amax;
+        tmp[col] = acol;
+    }
+    barrier();
+
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
-                tmpmax[col] = tmpmax[col + s];
-                tmp[col] = tmp[col + s];
+        if (lid < s && lid + s < p.KX) {
+            if (tmpmax[lid] < tmpmax[lid + s]) {
+                tmpmax[lid] = tmpmax[lid + s];
+                tmp[lid] = tmp[lid + s];
             }
         }
         barrier();
     }
 
-    if (col == 0) {
+    if (lid == 0) {
         data_d[row] = D_TYPE(tmp[0]);
     }
 }
