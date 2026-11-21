@@ -174,15 +174,29 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
 }
 
+ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *> & blocks) {
+    auto it = stacks.find(blocks);
+    if (it != stacks.end()) {
+        return it->second;
+    }
+    ggml_tensor * out = ggml_reshape_3d(ctx0, blocks.back(), n_embd, 1, n_tokens);
+    if (blocks.size() > 1) {
+        out = ggml_concat(ctx0, out, stack({blocks.begin(), blocks.end() - 1}), 1);
+    }
+    return stacks[blocks] = out;
+}
+
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+    if (!blocks.empty()) {
+        states = ggml_concat(ctx0, stack(blocks), states, 1);
     }
     states = ggml_rms_norm(ctx0, states, 1e-6f);
 
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    // a single token needs no copy of the query per token
+    ggml_tensor * queries = n_tokens == 1 ? query
+        : ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
