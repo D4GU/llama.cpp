@@ -17553,8 +17553,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         }
         // Second pass grabs view nodes.
-        // Skip this if it would break a fusion optimization (don't split up add->rms_norm or add->add).
-        if (graph->nodes[current_set.back()]->op != GGML_OP_ADD) {
+        // Skip this if it would break a fusion optimization (don't split up add->rms_norm, add->add or a soft_max
+        // from the mul_mat that reads it next).
+        const int last = current_set.back();
+        const bool soft_max_mul_mat = graph->nodes[last]->op == GGML_OP_SOFT_MAX && last + 1 < graph->n_nodes &&
+                                      graph->nodes[last + 1]->op == GGML_OP_MUL_MAT && graph->nodes[last + 1]->src[1] == graph->nodes[last];
+        if (graph->nodes[last]->op != GGML_OP_ADD && !soft_max_mul_mat) {
             for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
                 if (used[j]) {
                     continue;
