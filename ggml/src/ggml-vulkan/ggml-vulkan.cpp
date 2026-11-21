@@ -8206,6 +8206,87 @@ void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_
         { (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], (uint32_t)dst->ne[3] });
 }
 
+// Two single-column MUL_MATs of equally shaped F32 weights with the same src1, such as the forget and gain
+// projections of an Inkling 2 loop controller. When both weights lie in one buffer and both outputs in one
+// buffer, in the same order, the unchanged mat-vec pipeline computes both as two batches whose strides
+// reach from the first weight and output to the second
+struct vk_mul_mat_vec_pair {
+    vk_subbuffer a, d;           // from the first weight and output through the second
+    uint32_t stride_a, stride_d; // in floats
+};
+
+static bool ggml_vk_get_mul_mat_vec_pair(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx, vk_mul_mat_vec_pair * pair) {
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm[2] = { cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1] };
+    if (mm[0]->op != GGML_OP_MUL_MAT || mm[1]->op != GGML_OP_MUL_MAT || mm[0]->src[1] != mm[1]->src[1] ||
+        mm[1]->src[0] == mm[0] || (mm[1]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    const ggml_tensor * b = mm[0]->src[1];
+    if (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || b->ne[1] != 1 || b->ne[2] != 1 || b->ne[3] != 1 ||
+        get_misalign_bytes(ctx, b) != 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : mm) {
+        const ggml_tensor * a = t->src[0];
+        if (a->type != GGML_TYPE_F32 || t->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, mm[0]->src[0]) ||
+            a->ne[2] != 1 || a->ne[3] != 1 || !ggml_is_contiguous(a) || !ggml_is_contiguous(t) ||
+            get_misalign_bytes(ctx, a) != 0 || get_misalign_bytes(ctx, t) != 0) {
+            return false;
+        }
+    }
+
+    vk_subbuffer a[2] = { ggml_vk_tensor_subbuffer(ctx, mm[0]->src[0]), ggml_vk_tensor_subbuffer(ctx, mm[1]->src[0]) };
+    vk_subbuffer d[2] = { ggml_vk_tensor_subbuffer(ctx, mm[0]), ggml_vk_tensor_subbuffer(ctx, mm[1]) };
+    if (a[0].buffer != a[1].buffer || d[0].buffer != d[1].buffer) {
+        return false;
+    }
+    if (a[1].offset < a[0].offset) {
+        std::swap(a[0], a[1]);
+        std::swap(d[0], d[1]);
+    }
+    if (d[1].offset < d[0].offset + d[0].size || a[1].offset < a[0].offset + a[0].size) {
+        return false;
+    }
+    const size_t span_a = a[1].offset + a[1].size - a[0].offset;
+    const size_t span_d = d[1].offset + d[1].size - d[0].offset;
+    // the second weight must start at a multiple of 4 floats, so that it takes the same aligned path as the first
+    if ((a[1].offset - a[0].offset) % (4 * sizeof(float)) != 0 || (d[1].offset - d[0].offset) % sizeof(float) != 0 ||
+        span_a > ctx->device->properties.limits.maxStorageBufferRange ||
+        span_d > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    if (pair) {
+        pair->a = { a[0].buffer, a[0].offset, span_a };
+        pair->d = { d[0].buffer, d[0].offset, span_d };
+        pair->stride_a = (uint32_t)((a[1].offset - a[0].offset) / sizeof(float));
+        pair->stride_d = (uint32_t)((d[1].offset - d[0].offset) / sizeof(float));
+    }
+    return true;
+}
+
+static void ggml_vk_mul_mat_vec_pair(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    vk_mul_mat_vec_pair pair;
+    GGML_ASSERT(ggml_vk_get_mul_mat_vec_pair(ctx, cgraph, node_idx, &pair));
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    const uint32_t k = (uint32_t)mm->src[0]->ne[0];
+    const uint32_t m = (uint32_t)mm->src[0]->ne[1];
+
+    // the pipeline and push constants of ggml_vk_mul_mat_vec_q_f16 for one of the two, with a batch of two:
+    // batch 1 reads the second weight and writes the second output, both read the same src1
+    vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, GGML_TYPE_F32, GGML_TYPE_F32, 1, m, k);
+    ggml_pipeline_request_descriptor_sets(ctx, dmmv, 1);
+    const vk_mat_vec_push_constants pc = {
+        k, k, k, m,
+        pair.stride_a, 0, pair.stride_d,
+        0, 0,
+        2, 2, 1, 1,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, dmmv, { pair.a, ggml_vk_tensor_subbuffer(ctx, mm->src[1]), pair.d, pair.d, pair.d }, pc, { m, 2, 1 });
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -14092,7 +14173,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL_MAT:
-        ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->fused_mul_mat_vec_pair) {
+            ggml_vk_mul_mat_vec_pair(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_mul_mat(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
     case GGML_OP_MUL_MAT_ID:
@@ -16101,6 +16186,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ssm_conv_res = false;
         ctx->fused_mix_norm = false;
         ctx->fused_attn_rel_bias = false;
+        ctx->fused_mul_mat_vec_pair = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -16120,6 +16206,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_get_mul_mat_vec_pair(ctx, cgraph, i, nullptr)) {
+                ctx->num_additional_fused_ops = 1;
+                // the first MUL_MAT is an output too
+                ctx->fused_ops_write_mask |= 1 << 0;
+                ctx->fused_mul_mat_vec_pair = true;
+                fusion_string = "MUL_MAT_VEC_PAIR";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
@@ -16396,6 +16490,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ssm_conv_res = false;
                 ctx->fused_mix_norm = false;
                 ctx->fused_attn_rel_bias = false;
+                ctx->fused_mul_mat_vec_pair = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }

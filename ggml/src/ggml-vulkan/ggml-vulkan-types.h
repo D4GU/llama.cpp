@@ -1484,6 +1484,7 @@ struct ggml_backend_vk_context {
     bool fused_ssm_conv_res {};
     bool fused_mix_norm {};
     bool fused_attn_rel_bias {};
+    bool fused_mul_mat_vec_pair {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
