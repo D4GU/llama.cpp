@@ -621,6 +621,26 @@ static constexpr std::initializer_list<std::array<int, 3>> loop_ctrl_edges {
     { 5, 1, 4 }, // add->src[1] == gain mul
 };
 
+// Inkling 2 attention bias: the projected bias table minus the sink logits, gathered by distance into a per-head
+// flash attention mask: cpy_f16(add(permute(get_rows(permute(sub(table, sink)), rel)), cpy_f32(mask)))
+static constexpr std::initializer_list<ggml_op> attn_rel_bias_pattern { GGML_OP_SUB,      GGML_OP_PERMUTE, GGML_OP_CONT,
+                                                                        GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE,
+                                                                        GGML_OP_CONT,     GGML_OP_CPY,     GGML_OP_ADD,
+                                                                        GGML_OP_CPY };
+
+// relative to the SUB node
+static constexpr std::initializer_list<std::array<int, 3>> attn_rel_bias_edges {
+    { 1, 0, 0 }, // permute->src[0]  == sub
+    { 2, 0, 1 }, // cont->src[0]     == permute
+    { 3, 0, 2 }, // get_rows->src[0] == cont
+    { 4, 0, 3 }, // reshape->src[0]  == get_rows
+    { 5, 0, 4 }, // permute->src[0]  == reshape
+    { 6, 0, 5 }, // cont->src[0]     == permute
+    { 8, 0, 6 }, // add->src[0]      == cont
+    { 8, 1, 7 }, // add->src[1]      == cpy (mask cast)
+    { 9, 0, 8 }, // cpy->src[0]      == add
+};
+
 // short convolution with a scaled residual, (res + conv(x, w)) * s + b
 static constexpr std::initializer_list<ggml_op> ssm_conv_res_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 
@@ -1018,6 +1038,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_l2_clip_f32[2]; // [with leading MUL]
     vk_pipeline pipeline_situ_f32;
     vk_pipeline pipeline_loop_ctrl_f32;
+    vk_pipeline pipeline_attn_rel_bias;
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_unary[GGML_UNARY_OP_COUNT][3];
@@ -1455,6 +1476,7 @@ struct ggml_backend_vk_context {
     bool fused_loop_ctrl {};
     bool fused_ssm_conv_res {};
     bool fused_mix_norm {};
+    bool fused_attn_rel_bias {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

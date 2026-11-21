@@ -1,0 +1,45 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+// Fused Inkling 2 attention bias, the per-head flash attention mask d = f16((table[rel] - sink) + mask)
+//   table [n_rel, n_head, n_tokens], sink [n_head, n_tokens], rel [n_kv, n_tokens], mask [n_kv, n_tokens] and
+//   d [n_kv, n_seq_tokens, n_head, n_stream], all contiguous, with token t = s*n_seq_tokens + j
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer T {float     data_t[];};
+layout (binding = 1) readonly  buffer S {float     data_s[];};
+layout (binding = 2) readonly  buffer R {int       data_r[];};
+layout (binding = 3) readonly  buffer M {float16_t data_m[];};
+layout (binding = 4) writeonly buffer D {float16_t data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ne;
+    uint n_kv, n_seq_tokens, n_head, n_rel;
+    uint t_offset, s_offset, r_offset, m_offset, d_offset;
+    uint zero;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint k   = idx % p.n_kv;
+    const uint row = idx / p.n_kv;
+    const uint j   = row % p.n_seq_tokens;
+    const uint h   = (row / p.n_seq_tokens) % p.n_head;
+    const uint s   = row / (p.n_seq_tokens * p.n_head);
+    const uint t   = s * p.n_seq_tokens + j;
+
+    const uint rel = uint(data_r[p.r_offset + t * p.n_kv + k]);
+
+    // the SUB, the f16 to f32 mask copy and the ADD of the unfused chain, each rounded on its own
+    precise float d = data_t[p.t_offset + (t * p.n_head + h) * p.n_rel + rel] - data_s[p.s_offset + t * p.n_head + h];
+    d = d + float(data_m[p.m_offset + t * p.n_kv + k]);
+
+    // the compiler would round the f32 sum straight to f16 (v_fma_mixlo_f16 on RADV), once instead of twice as
+    // the separate ADD and CPY do. A zero it cannot see keeps the f32 rounding
+    data_d[p.d_offset + idx] = float16_t(uintBitsToFloat(floatBitsToUint(d) | p.zero));
+}
