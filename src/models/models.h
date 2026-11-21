@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <tuple>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2562,6 +2563,10 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // consecutive layers mix the same blocks, so each stack is built once per graph
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> stacks;
+        // each mix and its normalized states with their transpose are built once per graph: all layers
+        // of a looped pass mix the bank of the previous pass, and every pass starts with the same first mix
+        std::map<std::tuple<std::vector<ggml_tensor *>, ggml_tensor *, ggml_tensor *>, ggml_tensor *> mixes;
+        std::map<std::pair<std::vector<ggml_tensor *>, ggml_tensor *>, std::pair<ggml_tensor *, ggml_tensor *>> depths;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
