@@ -4286,6 +4286,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_res_f32,       "ssm_conv_res_f32",       ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11541,7 +11542,39 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
+        1.0f, 0.0f,
     });
+}
+
+// node_idx is the SSM_CONV, the start of ssm_conv_res_pattern
+static void ggml_vk_ssm_conv_res(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * conv = cgraph->nodes[node_idx];
+    const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
+    ggml_tensor *       dst  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * src0 = conv->src[0];
+    const ggml_tensor * src1 = conv->src[1];
+    const ggml_tensor * res  = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_res_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // dst is contiguous with the shape of the conv output, so the conv strides address it per sequence
+    const vk_op_ssm_conv_push_constants pc = {
+        (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
+        (uint32_t)src1->nb[1],
+        (uint32_t)conv->nb[0], (uint32_t)conv->nb[1], (uint32_t)conv->nb[2],
+        (uint32_t)src1->ne[0],
+        (uint32_t)src0->ne[0],
+        (uint32_t)src0->ne[1],
+        (uint32_t)conv->ne[1],
+        (uint32_t)conv->ne[2],
+        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, src0, true), ggml_vk_tensor_subbuffer(ctx, src1, true),
+        ggml_vk_tensor_subbuffer(ctx, res, true), ggml_vk_tensor_subbuffer(ctx, dst, true),
+    }, pc, { (uint32_t)src0->ne[1], (uint32_t)conv->ne[1], (uint32_t)conv->ne[2] });
 }
 
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
@@ -14034,7 +14067,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_SSM_CONV:
-        ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->fused_ssm_conv_res) {
+            ggml_vk_ssm_conv_res(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_ssm_conv(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
 
@@ -15563,6 +15600,38 @@ static bool ggml_vk_can_fuse_loop_ctrl(const struct ggml_cgraph * cgraph, int no
     return true;
 }
 
+static bool ggml_vk_can_fuse_ssm_conv_res(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ssm_conv_res_pattern, { node_idx + 3 }) ||
+        !ggml_check_edges(cgraph, node_idx, ssm_conv_res_edges)) {
+        return false;
+    }
+
+    const ggml_tensor * conv    = cgraph->nodes[node_idx];
+    const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add     = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * out     = cgraph->nodes[node_idx + 3];
+    // exactly one ADD src is the conv output, the other is the residual
+    if ((add->src[0] == reshape) == (add->src[1] == reshape)) {
+        return false;
+    }
+    const ggml_tensor * res = add->src[0] == reshape ? add->src[1] : add->src[0];
+
+    if (conv->src[0]->type != GGML_TYPE_F32 || conv->src[1]->type != GGML_TYPE_F32 || conv->type != GGML_TYPE_F32 ||
+        res->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the shader reads the residual and writes the output at the conv output index, without broadcasting
+    if (!ggml_are_same_shape(reshape, add) || !ggml_are_same_shape(res, add) || !ggml_are_same_shape(out, add) ||
+        !ggml_is_contiguous(conv) || !ggml_is_contiguous(res) || !ggml_is_contiguous(out)) {
+        return false;
+    }
+    // the push constants carry no per-tensor offset
+    if (get_misalign_bytes(ctx, res) != 0 || get_misalign_bytes(ctx, out) != 0) {
+        return false;
+    }
+    return true;
+}
+
 bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise) {
     ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)a->buffer->context;
     vk_buffer a_buf = a_buf_ctx->dev_buffer;
@@ -15853,6 +15922,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_l2_clip = false;
         ctx->fused_situ = false;
         ctx->fused_loop_ctrl = false;
+        ctx->fused_ssm_conv_res = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -15951,6 +16021,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_ssm_conv_res(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = ssm_conv_res_pattern.size() - 1;
+                ctx->fused_ssm_conv_res = true;
+                fusion_string = "SSM_CONV_RES";
+                // the conv reads several tokens per output; each thread reads the residual where it writes
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -16119,6 +16198,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_l2_clip = false;
                 ctx->fused_situ = false;
                 ctx->fused_loop_ctrl = false;
+                ctx->fused_ssm_conv_res = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -16388,6 +16468,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(loop_ctrl_pattern)) {
             continue;
         }
+        if (keep_pattern(ssm_conv_res_pattern)) {
+            continue;
+        }
         if (keep_pattern(topk_qsa_pattern)) {
             continue;
         }
@@ -16442,6 +16525,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(l2_clip_pattern, j) ||
                 in_pattern(topk_qsa_pattern, j) ||
                 in_pattern(loop_ctrl_pattern, j) ||
+                match_pattern(ssm_conv_res_pattern, j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||

@@ -621,6 +621,15 @@ static constexpr std::initializer_list<std::array<int, 3>> loop_ctrl_edges {
     { 5, 1, 4 }, // add->src[1] == gain mul
 };
 
+// short convolution with a scaled residual, (res + conv(x, w)) * s + b
+static constexpr std::initializer_list<ggml_op> ssm_conv_res_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
+
+// relative to the SSM_CONV node; the ADD takes the RESHAPE as either src
+static constexpr std::initializer_list<std::array<int, 3>> ssm_conv_res_edges {
+    { 1, 0, 0 }, // reshape->src[0] == ssm_conv
+    { 3, 0, 2 }, // scale->src[0]   == add
+};
+
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
@@ -1085,6 +1094,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_res_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1432,6 +1442,7 @@ struct ggml_backend_vk_context {
     bool fused_l2_clip {};
     bool fused_situ {};
     bool fused_loop_ctrl {};
+    bool fused_ssm_conv_res {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
