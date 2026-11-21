@@ -1,0 +1,66 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused per-row L2 norm clip: y = x * clamp(threshold / (sqrt(sum(x*x)) * scale + bias), clamp_min, clamp_max)
+//   x = data_a, or data_a * data_b with do_multiply, where data_b broadcasts whole rows
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A {float data_a[];};
+layout (binding = 1) readonly  buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const bool do_multiply = false;
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint nrows;
+    uint ne01, ne02;
+    uint ne11, ne12, ne13;
+    uint a_offset, b_offset, d_offset;
+    float scale, bias;
+    float threshold;
+    float clamp_min, clamp_max;
+} p;
+
+shared float tmp[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+
+    if (row >= p.nrows) { return; }
+
+    const uint i01 = row % p.ne01;
+    const uint i02 = (row / p.ne01) % p.ne02;
+    const uint i03 = row / (p.ne01 * p.ne02);
+
+    const uint a_base = p.a_offset + row * p.ncols;
+    const uint b_base = p.b_offset + (((i03 % p.ne13) * p.ne12 + i02 % p.ne12) * p.ne11 + i01 % p.ne11) * p.ncols;
+    const uint d_base = p.d_offset + row * p.ncols;
+
+    // same summation order as sum_rows.comp; precise keeps each square rounded on its own,
+    // as the separate SQR op stores it, instead of contracting it into an fma
+    precise float sum = 0.0;
+    for (uint i = col; i < p.ncols; i += BLOCK_SIZE) {
+        const float x = do_multiply ? data_a[a_base + i] * data_b[b_base + i] : data_a[a_base + i];
+        sum += x * x;
+    }
+    tmp[col] = sum;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            tmp[col] += tmp[col + s];
+        }
+        barrier();
+    }
+
+    const float factor = clamp(p.threshold / (sqrt(tmp[0]) * p.scale + p.bias), p.clamp_min, p.clamp_max);
+
+    for (uint i = col; i < p.ncols; i += BLOCK_SIZE) {
+        const float x = do_multiply ? data_a[a_base + i] * data_b[b_base + i] : data_a[a_base + i];
+        data_d[d_base + i] = x * factor;
+    }
+}

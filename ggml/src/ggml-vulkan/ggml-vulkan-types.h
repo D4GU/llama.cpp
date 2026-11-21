@@ -562,6 +562,28 @@ static constexpr std::initializer_list<ggml_op> snake_pattern              { GGM
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
 
+// x*clamp(t/(sqrt(sum_rows(x*x))*s + b), lo, hi): each row of x clipped to an L2 norm of about t
+static constexpr std::initializer_list<ggml_op> l2_clip_pattern { GGML_OP_SQR,   GGML_OP_SUM_ROWS, GGML_OP_SQRT,
+                                                                  GGML_OP_SCALE, GGML_OP_FILL,     GGML_OP_DIV,
+                                                                  GGML_OP_CLAMP, GGML_OP_MUL };
+
+// the same, with x = MUL(cur, w) computed in the fused op
+static constexpr std::initializer_list<ggml_op> mul_l2_clip_pattern { GGML_OP_MUL,   GGML_OP_SQR,   GGML_OP_SUM_ROWS,
+                                                                      GGML_OP_SQRT,  GGML_OP_SCALE, GGML_OP_FILL,
+                                                                      GGML_OP_DIV,   GGML_OP_CLAMP, GGML_OP_MUL };
+
+// relative to the SQR node
+static constexpr std::initializer_list<std::array<int, 3>> l2_clip_edges {
+    { 1, 0, 0 }, // sum_rows->src[0] == sqr
+    { 2, 0, 1 }, // sqrt->src[0]     == sum_rows
+    { 3, 0, 2 }, // scale->src[0]    == sqrt
+    { 4, 0, 3 }, // fill->src[0]     == scale
+    { 5, 0, 4 }, // div->src[0]      == fill
+    { 5, 1, 3 }, // div->src[1]      == scale
+    { 6, 0, 5 }, // clamp->src[0]    == div
+    { 7, 1, 6 }, // mul->src[1]      == clamp
+};
+
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
@@ -936,6 +958,7 @@ struct vk_device_struct {
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
+    vk_pipeline pipeline_l2_clip_f32[2]; // [with leading MUL]
 
     // [src/dst 0=fp32,1=fp16,2=bf16]
     vk_pipeline pipeline_unary[GGML_UNARY_OP_COUNT][3];
@@ -1367,6 +1390,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_l2_clip {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
