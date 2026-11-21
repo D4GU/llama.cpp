@@ -77,6 +77,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixMaintenance1FeaturesEXT {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -659,6 +660,13 @@ static constexpr std::initializer_list<std::array<int, 3>> ssm_conv_res_edges {
 // the same, then the residual ADD of the layer, skip + that; the ADD takes the SCALE as either src
 static constexpr std::initializer_list<ggml_op> ssm_conv_res_skip_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE, GGML_OP_ADD };
 
+// what a short convolution reads and writes when it replaces the CONCAT of its past and the CPY of its
+// state store: past is the CONCAT's first src, store the CPY whose dst is the state cache
+struct vk_conv_state {
+    const ggml_tensor * past;
+    const ggml_tensor * store;
+};
+
 // the depth states of Inkling 2 mix(): rms_norm(concat(stack, cur, 1)) and its transposed copy
 static constexpr std::initializer_list<ggml_op> mix_norm_pattern { GGML_OP_CONCAT, GGML_OP_RMS_NORM, GGML_OP_TRANSPOSE, GGML_OP_CONT };
 
@@ -1136,7 +1144,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
-    vk_pipeline pipeline_ssm_conv_res_f32[2]; // [with skip]
+    vk_pipeline pipeline_ssm_conv_res_f32[2][2]; // [reads its state][with skip]
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1489,6 +1497,12 @@ struct ggml_backend_vk_context {
     bool fused_attn_rel_bias {};
     bool fused_mul_mat_vec_pair {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+
+    // short convolutions that read their past and write their state cache in place of the CONCAT and CPY
+    // nodes around them, by SSM_CONV node; set up per graph by ggml_vk_find_conv_states
+    std::unordered_map<const ggml_tensor *, vk_conv_state> conv_states;
+    std::unordered_set<const ggml_tensor *> conv_state_skip;
+    const vk_conv_state * fused_conv_state {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
