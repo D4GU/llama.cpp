@@ -156,6 +156,49 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+// a weight built at load from the bytes of parts back to back, zero-filled to its size, in a weight buffer of the first part's type
+ggml_tensor * llama_model_inkling2::make_weight(llama_model_loader & ml, const std::vector<ggml_tensor *> & parts,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, const std::string & name) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_tensor * out = ggml_new_tensor_4d(ctx.get(), parts[0]->type, ne0, ne1, ne2, ne3);
+    ggml_set_name(out, name.c_str());
+
+    size_t size = 0;
+    for (ggml_tensor * part : parts) {
+        size += ggml_nbytes(part);
+        if (part->type != out->type || size > ggml_nbytes(out)) {
+            throw std::runtime_error(format("inkling2: %s does not fit into %s", part->name, out->name));
+        }
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(parts[0]->buffer);
+    ggml_backend_buffer_ptr buf { ml.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) : ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        throw std::runtime_error(format("inkling2: unable to allocate %s", out->name));
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    if (ml.no_alloc) {
+        out->buffer = buf.get();
+    } else {
+        std::vector<uint8_t> data(ggml_nbytes(out), 0);
+        size_t offset = 0;
+        for (ggml_tensor * part : parts) {
+            ggml_backend_tensor_get(part, data.data() + offset, 0, ggml_nbytes(part));
+            offset += ggml_nbytes(part);
+        }
+        ggml_backend_tensor_set(out, data.data(), 0, data.size());
+    }
+
+    derived.emplace_back(std::move(ctx), std::move(buf));
+    return out;
+}
+
 // a distance past the extent gathers a zero row of attn_rel_bias: append it once here instead of in every layer pass
 bool llama_model_inkling2::load_tensors(llama_model_loader & ml) {
     if (!llama_model_base::load_tensors(ml)) {
@@ -168,31 +211,7 @@ bool llama_model_inkling2::load_tensors(llama_model_loader & ml) {
         ggml_tensor *& bias = layers[il].attn_rel_bias;
         auto it = padded.find(bias);
         if (it == padded.end()) {
-            ggml_init_params params = {
-                /*.mem_size   =*/ ggml_tensor_overhead(),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-            ggml_context_ptr ctx { ggml_init(params) };
-            ggml_tensor * table = ggml_new_tensor_2d(ctx.get(), bias->type, bias->ne[0], bias->ne[1] + 1);
-            ggml_format_name(table, "%s.padded", bias->name);
-
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(bias->buffer);
-            ggml_backend_buffer_ptr buf { ml.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) : ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
-            if (!buf) {
-                throw std::runtime_error(format("inkling2: unable to allocate %s", table->name));
-            }
-            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-            if (ml.no_alloc) {
-                table->buffer = buf.get();
-            } else {
-                std::vector<uint8_t> data(ggml_nbytes(table), 0);
-                ggml_backend_tensor_get(bias, data.data(), 0, ggml_nbytes(bias));
-                ggml_backend_tensor_set(table, data.data(), 0, data.size());
-            }
-
-            rel_bias_padded.emplace_back(std::move(ctx), std::move(buf));
+            ggml_tensor * table = make_weight(ml, { bias }, bias->ne[0], bias->ne[1] + 1, 1, 1, format("%s.padded", bias->name));
             it = padded.emplace(bias, table).first;
         }
         bias = it->second;
@@ -237,6 +256,7 @@ ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
+// query is [n_embd, n_query, 1, n_set], the result [n_embd, n_query, n_tokens, n_set]
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
     ggml_tensor *& out = mixes[{blocks, cur, query}];
     if (out) {
@@ -253,14 +273,23 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
         states_t = ggml_cont(ctx0, ggml_transpose(ctx0, states));
     }
 
-    // a single token needs no copy of the query per token
-    ggml_tensor * queries = n_tokens == 1 ? query
-        : ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    const int64_t n_query = query->ne[1];
+    const int64_t n_set   = query->ne[3];
+
+    // a single token needs no copy of the query per token. It runs several sets as a batch of single queries:
+    // a mat-vec computes each column of several queries as it computes a single one
+    ggml_tensor * queries = query;
+    if (n_tokens > 1) {
+        queries = ggml_repeat(ctx0, query, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd, n_query, n_tokens, n_set));
+    } else if (n_set > 1) {
+        queries = ggml_reshape_3d(ctx0, query, n_embd, 1, n_query*n_set);
+    }
 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return out = ggml_mul_mat(ctx0, states_t, scores);
+    out = ggml_mul_mat(ctx0, states_t, scores);
+    return out = n_set > 1 ? ggml_reshape_4d(ctx0, out, n_embd, n_query, n_tokens, n_set) : out;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -356,8 +385,8 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-        ggml_tensor * messages, const loop_layer * loop) {
-    GGML_ASSERT(!messages == !loop);
+        ggml_tensor * messages, ggml_tensor * message_norms, const loop_layer * loop) {
+    GGML_ASSERT(!messages == !loop && !messages == !message_norms);
 
     const auto & layer = model.layers[il];
 
@@ -371,8 +400,6 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     auto message = [&](ggml_tensor * t, int ctrl) {
         return contiguous(ctx0, ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], ctrl*t->nb[1]));
     };
-    // one RMS_NORM for all messages, each row normalized on its own
-    ggml_tensor * message_norms = messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
     ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);

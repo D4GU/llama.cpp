@@ -67,6 +67,21 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+// all core layers of a looped pass mix the same bank, so one weight of all their queries mixes their messages at once
+bool llama_model_inkling2_loop::load_tensors(llama_model_loader & ml) {
+    if (!llama_model_inkling2::load_tensors(ml)) {
+        return false;
+    }
+
+    std::vector<ggml_tensor *> queries;
+    for (const auto & l : loop_layers) {
+        queries.push_back(l.msg_query);
+    }
+    msg_queries = make_weight(ml, queries, hparams.n_embd, LOOP_CTRL_COUNT, 1, queries.size(), "loop_msg_query.stacked");
+
+    return true;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }
@@ -89,11 +104,16 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         // the bank of the previous pass: its blocks after the first core block, and its output
         std::vector<ggml_tensor *> bank;
         ggml_tensor * bank_out = nullptr;
+        // the messages of all core layers and their norms, each row normalized on its own
+        ggml_tensor * messages      = nullptr;
+        ggml_tensor * message_norms = nullptr;
         if (pass > 0) {
             bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
             bank_out = cur;
             cur = prelude;
             blocks = prelude_blocks;
+            messages      = mix(bank, bank_out, m.msg_queries);
+            message_norms = ggml_rms_norm(ctx0, messages, 1e-6f);
         }
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
@@ -101,8 +121,11 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
             }
-            const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            // the [n_embd, LOOP_CTRL_COUNT, n_tokens] of this layer
+            auto layer_view = [&](ggml_tensor * t) {
+                return ggml_view_3d(ctx0, t, n_embd, LOOP_CTRL_COUNT, n_tokens, t->nb[1], t->nb[2], (ip - start)*t->nb[3]);
+            };
+            cur = build_layer(il, ip, cur, blocks, layer_view(messages), layer_view(message_norms), &m.loop_layers[ip - start]);
         }
     }
 
