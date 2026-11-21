@@ -2491,10 +2491,14 @@ struct llama_model_inkling2 : public llama_model_base {
     llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    bool load_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // the attn_rel_bias tables with their zero row, see load_tensors()
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> rel_bias_padded;
 
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
@@ -2547,6 +2551,9 @@ struct llama_model_inkling2 : public llama_model_base {
         // of a looped pass mix the bank of the previous pass, and every pass starts with the same first mix
         std::map<std::tuple<std::vector<ggml_tensor *>, ggml_tensor *, ggml_tensor *>, ggml_tensor *> mixes;
         std::map<std::pair<std::vector<ggml_tensor *>, ggml_tensor *>, std::pair<ggml_tensor *, ggml_tensor *>> depths;
+
+        // zero attention sinks by head count, filled once per graph
+        std::map<int64_t, ggml_tensor *> zero_sinks;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
