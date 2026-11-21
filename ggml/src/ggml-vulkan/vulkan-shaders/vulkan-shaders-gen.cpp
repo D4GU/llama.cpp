@@ -884,6 +884,7 @@ void process_shaders() {
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_clip_f32", "l2_clip.comp", {});
+    string_to_spv("l2_clip_row_mul_f32", "l2_clip.comp", {{"L2_CLIP_ROW_MUL", "1"}});
     string_to_spv("situ_f32", "situ.comp", {});
     string_to_spv("loop_ctrl_f32", "loop_ctrl.comp", {});
     string_to_spv("attn_rel_bias", "attn_rel_bias.comp", {});
