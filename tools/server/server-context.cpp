@@ -3832,7 +3832,14 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+
+                // A draft longer than the target's rollback depth is verified through a checkpoint and a replay batch.
+                // The replay does not output every token, so the target does not compute it as plain decoding does and
+                // the answer stops being bit-identical. The n-gram drafters have their own length limits.
+                if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                    n_draft_max = std::min(n_draft_max, (int) llama_n_rs_seq(ctx_tgt));
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
