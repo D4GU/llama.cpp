@@ -1544,13 +1544,62 @@ static float inkling2_accept_rate(float conf) {
     return 0.978f;
 }
 
+// Pauses drafting on text where it loses time. Costs are in units of one plain token on a Radeon 8060S with Inkling
+// 2 Mini Q4_K_M: a step that verifies n drafts takes about 1 + step_cost + draft_cost*n. The decision uses counts
+// only, never clocks, so a prompt gives the same text on every run.
+struct inkling2_draft_guard {
+    static constexpr float   step_cost   = 0.26f;
+    static constexpr float   draft_cost  = 0.25f;
+    static constexpr int32_t block_steps = 32;
+    static constexpr int32_t pause_min   = 64;
+    static constexpr int32_t pause_max   = 512;
+
+    int32_t steps      = 0;         // drafting steps in the current block
+    float   net        = 0.0f;      // tokens the drafts of the block gained minus what their steps cost
+    int32_t pause      = 0;         // tokens left without drafting
+    int32_t pause_next = pause_min; // doubles while every block after a pause loses again
+    int32_t n_pending  = 0;         // size of the draft that waits for its verification
+
+    bool paused() {
+        if (steps >= block_steps) {
+            if (net < 0) {
+                pause      = pause_next;
+                pause_next = std::min(2*pause_next, pause_max);
+            } else {
+                pause_next = pause_min;
+            }
+            steps = 0;
+            net   = 0.0f;
+        }
+        if (pause > 0) {
+            pause--;
+            return true;
+        }
+        return false;
+    }
+
+    void drafted(int32_t n) {
+        steps++;
+        net -= step_cost + draft_cost*n;
+        n_pending = n;
+    }
+
+    void accepted(int32_t n) {
+        if (n_pending > 0) {
+            net += n;
+            n_pending = 0;
+        }
+    }
+};
+
 struct common_speculative_impl_inkling2_dspark final : public common_speculative_impl_draft_dflash {
     std::vector<common_params_sampling> sampler_cfg;
     std::vector<std::mt19937> rng;
     std::vector<int64_t> seeds;
+    std::vector<inkling2_draft_guard> guards; // used with p_min > 0
 
     common_speculative_impl_inkling2_dspark(const common_params_speculative & config, uint32_t n_seq)
-        : common_speculative_impl_draft_dflash(config, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK), rng(n_seq), seeds(n_seq, -1) {
+        : common_speculative_impl_draft_dflash(config, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK), rng(n_seq), seeds(n_seq, -1), guards(n_seq) {
         const auto * model = llama_get_model(params.ctx_dft);
         char buf[32];
         if (llama_model_meta_val_str(model, "dflash.sample_from_anchor", buf, sizeof(buf)) < 0 ||
@@ -1575,6 +1624,16 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
         }
         if ((size_t) seq_id < sampler_cfg.size()) {
             sampler_cfg[seq_id].temp = NAN;
+        }
+        if ((size_t) seq_id < guards.size()) {
+            guards[seq_id] = {};
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        common_speculative_impl_draft_dflash::accept(seq_id, n_accepted, is_other);
+        if (!is_other && seq_id >= 0 && (size_t) seq_id < guards.size()) {
+            guards[seq_id].accepted(n_accepted);
         }
     }
 
@@ -1602,6 +1661,9 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
             }
             const int32_t count = dp.n_max >= 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
             if (count < params.n_min || count == 0) {
+                continue;
+            }
+            if (params.p_min > 0 && guards[seq_id].paused()) {
                 continue;
             }
             const bool sample = params.probabilistic && dp.result_q && dp.temp > 0;
@@ -1681,6 +1743,9 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                     }
                 } else if (sample) {
                     rng[seq_id] = next_rng;
+                }
+                if (params.p_min > 0) {
+                    guards[seq_id].drafted((int32_t) dp.result->size());
                 }
                 continue;
             }
