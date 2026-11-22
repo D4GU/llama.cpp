@@ -257,6 +257,26 @@ static ggml_tensor * inkling2_lm_head(llm_graph_context & g, const llama_model &
     return logits;
 }
 
+// (W Hout) latent. Rows of only rank values leave a mat-vec far below memory bandwidth, so a single latent column
+// views G rows of W Hout as one row of G*rank values and multiplies them by G block-diagonal copies of the latent.
+// Output column g then holds rows g, g + G, ..., and the transpose restores the row order.
+static ggml_tensor * inkling2_folded_correction(ggml_context * ctx, ggml_tensor * wh, ggml_tensor * latent) {
+    constexpr int64_t G = 8;
+    const int64_t rank = wh->ne[0];
+    const int64_t n = wh->ne[1];
+    if (latent->ne[1] != 1 || n % G != 0) {
+        auto * out = ggml_mul_mat(ctx, wh, latent);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        return out;
+    }
+    // latent followed by G*rank zeros, G times over: the first G*rank*G values are G diagonal blocks of latent
+    auto * z = ggml_repeat_4d(ctx, ggml_pad(ctx, latent, G*rank, 0, 0, 0), (G + 1)*rank, G, 1, 1);
+    auto * diag = ggml_view_2d(ctx, z, G*rank, G, G*rank*ggml_element_size(z), 0);
+    auto * out = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, wh, G*rank, n/G), diag);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
+    return ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_transpose(ctx, out)), n, 1);
+}
+
 // base holds the LM head of the hidden rows. It does not depend on the drafted tokens, so a block computes it for all
 // positions in one mat-vec, whose columns are bit-equal to separate ones.
 static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model & model, ggml_tensor * & state,
@@ -267,9 +287,7 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
     ggml_tensor * bias;
     if (model.dspark_hidden_out_lm) {
         // W (Hout latent + b) = (W Hout) latent + W b reads a rank-wide matrix instead of the whole LM head
-        bias = g.build_lora_mm(model.dspark_hidden_out_lm, latent);
-        ggml_prec_set_acc(bias, GGML_PREC_F32);
-        bias = ggml_add(g.ctx0, bias, model.dspark_hidden_out_lm_b);
+        bias = ggml_add(g.ctx0, inkling2_folded_correction(g.ctx0, model.dspark_hidden_out_lm, latent), model.dspark_hidden_out_lm_b);
     } else {
         auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
         bias = inkling2_lm_head(g, model, correction);
