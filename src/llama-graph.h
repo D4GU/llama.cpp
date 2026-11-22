@@ -995,6 +995,10 @@ public:
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
+    // the scheduler that allocated the graph, which knows the backend of each node: not always the context's main
+    // scheduler, as a graph slot of the context has its own
+    ggml_backend_sched_t get_sched() const { return params.sched; }
+
     int64_t get_max_nodes() const;
 
     void set_max_nodes(int64_t max_nodes);

@@ -289,13 +289,33 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // a small graph with its own scheduler: speculative verification and drafting change the token count from step
+    // to step, and a slot per shape lets them switch between ready graphs instead of rebuilding and reallocating one
+    struct graph_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        llm_graph_result     * active = nullptr; // like gf_res_prev_active: res, while its graph is allocated in sched
+    };
+
+    // speculative steps fit, a larger ubatch uses the main scheduler, as a slot's compute buffer grows with its token count
+    static constexpr uint32_t graph_slot_max_tokens = 8;
+
+    // the slot for the shape of ubatch, nullptr if the main scheduler builds it
+    graph_slot * graph_slot_get(const llama_ubatch & ubatch);
+
+    // no previous graph may be reused after this, e.g. because the scheduler was reset or the graph inputs changed
+    void graph_reset_prev();
+
+    ggml_status graph_compute(ggml_backend_sched_t gsched, ggml_cgraph * gf, bool batched);
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
+                    ggml_backend_sched_t   gsched,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t gsched) const;
 
     // parameters defining the backend scheduler instance
     struct sched_params {
@@ -313,6 +333,8 @@ private:
 
     // create a new backend scheduler with the given parameters, unless the current one can be reused
     void sched_new(const sched_params & params);
+
+    ggml_backend_sched_ptr sched_make(const sched_params & params);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -457,6 +479,9 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // [n_tokens - 1][ubatch has token ids][every token is an output], see graph_slot_get()
+    std::array<graph_slot, 4*graph_slot_max_tokens> graph_slots;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
