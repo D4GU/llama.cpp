@@ -1830,9 +1830,10 @@ llama_context::graph_slot * llama_context::graph_slot_get(const llama_ubatch & u
         return nullptr;
     }
 
-    // a drafter's feature injection and its draft block can have the same token count, and so can the tail of a
-    // prompt, which has one output, and a speculative verification, where every token is an output
-    auto & slot = graph_slots[4*(ubatch.n_tokens - 1) + 2*(ubatch.token != nullptr) + (n_outputs == ubatch.n_tokens)];
+    // a drafter's feature injection and its draft block can have the same token count, a prompt tail and a
+    // speculative verification differ in their outputs, and a draft block's output count shrinks at the end of a reply
+    const size_t n_out = graph_slot_max_tokens + 1;
+    auto & slot = graph_slots[(2*(ubatch.n_tokens - 1) + (ubatch.token != nullptr))*n_out + n_outputs];
     if (!slot.sched) {
         slot.sched = sched_make(sched_params_cur);
         slot.res   = std::make_unique<llm_graph_result>(graph_max_nodes());

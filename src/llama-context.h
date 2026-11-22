@@ -480,8 +480,8 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
-    // [n_tokens - 1][ubatch has token ids][every token is an output], see graph_slot_get()
-    std::array<graph_slot, 4*graph_slot_max_tokens> graph_slots;
+    // [n_tokens - 1][ubatch has token ids][n_outputs], see graph_slot_get()
+    std::array<graph_slot, 2*graph_slot_max_tokens*(graph_slot_max_tokens + 1)> graph_slots;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
