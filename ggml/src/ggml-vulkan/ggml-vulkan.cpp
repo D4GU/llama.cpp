@@ -3479,6 +3479,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_MXFP4],   "mul_mat_vec_id_mxfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_mxfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_mxfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_NVFP4],   "mul_mat_vec_id_nvfp4_f32",   OCP_DMMV_LEN(arr_dmmv_id_nvfp4_f32_f32, reduc16), OCP_DMMV_DATA(arr_dmmv_id_nvfp4_f32_f32, reduc16), "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq}, 1, true, use_subgroups16, force_subgroup_size16);
 
+        // the legacy quants hold the experts whose rows do not fit K-quant blocks, such as Inkling 2's k = 1152
+#define CREATE_DMMV_ID_TOKENS(TYPE, NAME, ROWS) \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_tokens_f32[w][TYPE], "mul_mat_vec_id_tokens_" #NAME "_f32", arr_dmmv_id_tokens_##NAME##_f32_f32_len[reduc], arr_dmmv_id_tokens_##NAME##_f32_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {ROWS, 1, 1}, {wg_size_subgroup, ROWS}, 1, true, use_subgroups, force_subgroup_size);
+        CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q2_0, q2_0, 2*rm_stdq);
+        CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q4_0, q4_0, 2*rm_stdq);
+        CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q4_1, q4_1, 2*rm_stdq);
+        CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q5_0, q5_0, 2*rm_stdq);
+        CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q5_1, q5_1, 2*rm_stdq);
+        CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q8_0, q8_0, 1*rm_stdq);
+#undef CREATE_DMMV_ID_TOKENS
+
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (device->integer_dot_product) {
             const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
@@ -6463,7 +6474,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         return all_tokens ? ctx->device->pipeline_dequant_mul_mat_vec_id_tokens_q8_1_f32[dmmv_wg][a_type] : ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[dmmv_wg][a_type];
     }
 
-    return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
+    return all_tokens ? ctx->device->pipeline_dequant_mul_mat_vec_id_tokens_f32[dmmv_wg][a_type] : ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
 vk_subbuffer ggml_vk_tensor_subbuffer(
@@ -8903,17 +8914,20 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // together in time, and all reads after the first come from cache. Groups of 4 to 32 workgroups did equally well
     // on Inkling 2 Mini, 64 was slower. The limit check counts one row per workgroup, so it can only overestimate z.
     const uint32_t wgs_per_row_group = 16;
-    bool all_tokens = quantize_y && nei1 > 1 && nei0 * CEIL_DIV(ne01, wgs_per_row_group) <= ctx->device->properties.limits.maxComputeWorkGroupCount[2];
+    bool all_tokens = nei1 > 1 && nei0 * CEIL_DIV(ne01, wgs_per_row_group) <= ctx->device->properties.limits.maxComputeWorkGroupCount[2];
 
     // Check for mmq first
     vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, GGML_TYPE_Q8_1, ne20, ne00, all_tokens) : nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
-        // Fall back to f16 dequant mul mat
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00);
+        // Fall back to f16 dequant mul mat, which has a variant for all tokens only for the legacy quants
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00, all_tokens);
         quantize_y = false;
-        all_tokens = false;
+        if (dmmv == nullptr) {
+            dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00);
+            all_tokens = false;
+        }
     }
     const uint32_t n_dispatches = all_tokens ? 1 : nei1;
 
