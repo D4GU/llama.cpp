@@ -76,6 +76,9 @@ struct common_speculative_draft_params {
     // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash2 sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
+    // the drafter's own top-1 probability per drafted token; only the Inkling 2 DSpark backend path fills it
+    std::vector<float> * result_conf = nullptr;
+
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;

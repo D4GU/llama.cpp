@@ -511,6 +511,7 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
     auto * prev = ggml_view_1d(ctx0, tokens, 1, 0);
     auto * state = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.dspark_context_rank), 0);
     auto * base = inkling2_lm_head(*this, model, ggml_view_2d(ctx0, hidden, n_embd, n_outputs, hidden->nb[1], hidden->nb[1]));
+    ggml_tensor * conf = nullptr;
     for (int i = 0; i < n_outputs; ++i) {
         auto * row = ggml_view_1d(ctx0, hidden, n_embd, (i + 1)*hidden->nb[1]);
         auto * features = ggml_concat(ctx0, row, inp->context, 0);
@@ -518,6 +519,7 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
         auto * logits = inkling2_head_step(*this, model, state, prev, features, base_i);
         ggml_build_forward_expand(gf, logits);
         const int first = ggml_graph_n_nodes(gf);
+        ggml_tensor * top;
         if (inp->draws) {
             auto * temp = ggml_view_1d(ctx0, inp->draws, 1, 0);
             auto * ticket = ggml_view_1d(ctx0, inp->draws, 1, (i + 1)*sizeof(float));
@@ -527,13 +529,24 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
             res->t_sampled_probs.push_back(q);
             res->t_sampling_all.push_back(q);
             ggml_build_forward_expand(gf, q);
+            top = ggml_argmax(ctx0, logits);
         } else {
             prev = inkling2_argmax(ctx0, logits);
+            top = prev;
         }
         cb(prev, "dspark_token", i);
         res->t_sampled.push_back(prev);
         res->t_sampling_all.push_back(prev);
         ggml_build_forward_expand(gf, prev);
+        // the drafter's own top-1 probability: softcapped logits at temperature 1
+        auto * p = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ggml_soft_max(ctx0, logits), 1, logits->ne[0]), top);
+        conf = conf ? ggml_concat(ctx0, conf, p, 1) : p;
+        if (i + 1 == n_outputs) {
+            // row j of the block carries the confidence of output j in element 0, like the DSpark confidence head
+            res->t_h_nextn = ggml_pad_ext(ctx0, conf, 0, n_embd - 1, 1, n_tokens - 1 - n_outputs, 0, 0, 0, 0);
+            conf = res->t_h_nextn;
+        }
+        ggml_build_forward_expand(gf, conf);
         for (int j = first; backend && j < ggml_graph_n_nodes(gf); ++j) {
             auto * node = ggml_graph_node(gf, j);
             if (!node->view_src && ggml_backend_supports_op(backend, node)) {

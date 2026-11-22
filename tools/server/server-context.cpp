@@ -304,6 +304,8 @@ struct server_slot {
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
+    // drafter top-1 probability per token in spec_draft; only the Inkling 2 DSpark backend path fills it
+    std::vector<float> spec_draft_conf;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -3837,6 +3839,7 @@ private:
 
                     // stale candidates: a replay never reads them, a new draft refills them
                     slot.spec_draft_q.clear();
+                    slot.spec_draft_conf.clear();
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -3867,6 +3870,7 @@ private:
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .result_conf = */ &slot.spec_draft_conf,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
                         };
@@ -4911,6 +4915,19 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                if (!slot.spec_is_replay && common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                    std::string conf;
+                    std::string toks;
+                    for (size_t i = 0; i < n_draft; ++i) {
+                        if (slot.spec_draft_conf.size() == n_draft) {
+                            conf += string_format("%s%.6f", i ? "," : "", slot.spec_draft_conf[i]);
+                        }
+                        toks += string_format("%s%d", i ? "," : "", slot.spec_draft[i]);
+                    }
+                    SLT_TRC(slot, "spec step: n_draft = %zu, n_accepted = %zu, conf = [%s], tokens = [%s]\n",
+                            n_draft, accepted.size() - 1, conf.c_str(), toks.c_str());
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

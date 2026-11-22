@@ -1620,11 +1620,15 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                 continue;
             }
             if (backend) {
+                const float * conf = dp.result_conf ? llama_get_embeddings_nextn(ctx) : nullptr;
                 bool valid = true;
                 for (int i = 1; valid && i <= count; ++i) {
                     const auto id = llama_get_sampled_token_ith(ctx, i);
                     valid = id >= 0 && id < n_vocab;
                     dp.result->push_back(id);
+                    if (conf) {
+                        dp.result_conf->push_back(conf[(size_t) i*width]);
+                    }
                     if (sample && valid) {
                         const float * probs = llama_get_sampled_probs_ith(ctx, i);
                         if (!probs) {
@@ -1644,6 +1648,9 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                 if (!valid) {
                     LOG_WRN("%s: invalid Inkling2 proposal block for sequence %d\n", __func__, seq_id);
                     dp.result->clear();
+                    if (dp.result_conf) {
+                        dp.result_conf->clear();
+                    }
                     if (dp.result_q) {
                         dp.result_q->clear();
                     }
@@ -3680,6 +3687,9 @@ void common_speculative_draft(common_speculative * spec) {
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {
                             dp.result_q->resize(dp.n_max);
+                        }
+                        if (dp.result_conf && !dp.result_conf->empty()) {
+                            dp.result_conf->resize(dp.n_max);
                         }
                     }
                 }
