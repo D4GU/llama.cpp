@@ -196,6 +196,16 @@ void llama_model_dflash::load_tensors_inkling2_head() {
     dspark_hidden_out_lm   = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT_LM, "weight"), {rank, hparams.n_vocab_padded}, TENSOR_NOT_REQUIRED);
     dspark_hidden_out_lm_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT_LM, "bias"),   {hparams.n_vocab_padded},
                                            dspark_hidden_out_lm ? 0 : TENSOR_NOT_REQUIRED);
+    // vocabulary short list: the block drafter scores only the target tokens d2t, whose LM-head rows and folded rows
+    // the file carries
+    if (const auto * meta = ml->get_tensor_meta("d2t")) {
+        const int64_t n_short = meta->ne[0];
+        d2t                   = create_tensor(tn(LLM_TENSOR_D2T),                         {n_short}, 0);
+        dspark_short_lm       = create_tensor(tn(LLM_TENSOR_DSPARK_SHORT_LM,     "weight"), {n_embd, n_short}, 0);
+        dspark_short_out_lm   = create_tensor(tn(LLM_TENSOR_DSPARK_SHORT_OUT_LM, "weight"), {rank, n_short}, 0);
+        dspark_short_out_lm_b = create_tensor(tn(LLM_TENSOR_DSPARK_SHORT_OUT_LM, "bias"),   {n_short}, 0);
+        LLAMA_LOG_INFO("%s: Inkling2 DSpark drafts from a short list of %lld tokens\n", __func__, (long long) n_short);
+    }
     for (int il = 0; il < n_layer; ++il) {
         auto & layer = layers[il];
         layer.dflare_norm     = create_tensor(tn(LLM_TENSOR_DFLARE_NORM,     "weight", il), {n_embd}, 0);
@@ -280,12 +290,14 @@ static ggml_tensor * inkling2_folded_correction(ggml_context * ctx, ggml_tensor 
 // base holds the LM head of the hidden rows. It does not depend on the drafted tokens, so a block computes it for all
 // positions in one mat-vec, whose columns are bit-equal to separate ones.
 static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model & model, ggml_tensor * & state,
-        ggml_tensor * prev, ggml_tensor * features, ggml_tensor * base) {
+        ggml_tensor * prev, ggml_tensor * features, ggml_tensor * base, bool short_list = false) {
     auto * prev_embd = ggml_get_rows(g.ctx0, model.dspark_markov_w1, prev);
     ggml_set_name(prev_embd, "dspark_prev_embd");
     auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
     ggml_tensor * bias;
-    if (model.dspark_hidden_out_lm) {
+    if (short_list) {
+        bias = ggml_add(g.ctx0, inkling2_folded_correction(g.ctx0, model.dspark_short_out_lm, latent), model.dspark_short_out_lm_b);
+    } else if (model.dspark_hidden_out_lm) {
         // W (Hout latent + b) = (W Hout) latent + W b reads a rank-wide matrix instead of the whole LM head
         bias = ggml_add(g.ctx0, inkling2_folded_correction(g.ctx0, model.dspark_hidden_out_lm, latent), model.dspark_hidden_out_lm_b);
     } else {
@@ -293,7 +305,9 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
         bias = inkling2_lm_head(g, model, correction);
     }
     auto * logits = ggml_add(g.ctx0, base, bias);
-    logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, base->ne[1], logits->nb[1], 0));
+    if (!short_list) {
+        logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, base->ne[1], logits->nb[1], 0));
+    }
     const float cap = model.hparams.f_final_logit_softcapping;
     return ggml_scale(g.ctx0, ggml_tanh(g.ctx0, ggml_scale(g.ctx0, logits, 1.0f/cap)), cap);
 }
@@ -519,13 +533,23 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
     }
     auto * prev = ggml_view_1d(ctx0, tokens, 1, 0);
     auto * state = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.dspark_context_rank), 0);
-    auto * base = inkling2_lm_head(*this, model, ggml_view_2d(ctx0, hidden, n_embd, n_outputs, hidden->nb[1], hidden->nb[1]));
+    auto * rows = ggml_view_2d(ctx0, hidden, n_embd, n_outputs, hidden->nb[1], hidden->nb[1]);
+    const bool short_list = model.dspark_short_lm != nullptr;
+    ggml_tensor * base;
+    if (short_list) {
+        base = ggml_mul_mat(ctx0, model.dspark_short_lm, rows);
+        ggml_prec_set_acc(base, GGML_PREC_F32);
+    } else {
+        base = inkling2_lm_head(*this, model, rows);
+    }
+    // a short-list position picks a row; d2t names its token
+    auto * short_ids = short_list ? ggml_reshape_2d(ctx0, model.d2t, 1, model.d2t->ne[0]) : nullptr;
     ggml_tensor * conf = nullptr;
     for (int i = 0; i < n_outputs; ++i) {
         auto * row = ggml_view_1d(ctx0, hidden, n_embd, (i + 1)*hidden->nb[1]);
         auto * features = ggml_concat(ctx0, row, inp->context, 0);
         auto * base_i = ggml_view_2d(ctx0, base, base->ne[0], 1, base->nb[1], i*base->nb[1]);
-        auto * logits = inkling2_head_step(*this, model, state, prev, features, base_i);
+        auto * logits = inkling2_head_step(*this, model, state, prev, features, base_i, short_list);
         ggml_build_forward_expand(gf, logits);
         const int first = ggml_graph_n_nodes(gf);
         ggml_tensor * top;
@@ -534,6 +558,12 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
             auto * ticket = ggml_view_1d(ctx0, inp->draws, 1, (i + 1)*sizeof(float));
             ggml_tensor * q;
             prev = inkling2_draw(ctx0, logits, temp, ticket, q);
+            if (short_list) {
+                // the host reads q over the whole vocabulary; tokens off the list have probability 0
+                const int64_t n_vocab = hparams.n_vocab_unpadded;
+                auto * full = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_vocab), 0.0f);
+                q = ggml_reshape_1d(ctx0, ggml_set_rows(ctx0, full, ggml_reshape_2d(ctx0, q, 1, q->ne[0]), model.d2t), n_vocab);
+            }
             cb(q, "dspark_q", i);
             res->t_sampled_probs.push_back(q);
             res->t_sampling_all.push_back(q);
@@ -543,6 +573,9 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
             // a draft only proposes, so exact ties may break differently than the host sampler's lowest ID
             prev = ggml_argmax(ctx0, logits);
             top = prev;
+        }
+        if (short_list) {
+            prev = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, short_ids, prev), 1);
         }
         cb(prev, "dspark_token", i);
         res->t_sampled.push_back(prev);
