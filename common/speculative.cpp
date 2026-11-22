@@ -1528,6 +1528,22 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     }
 };
 
+// Chance that the target accepts a drafted token whose predecessor it accepted, by the drafter's top-1 probability.
+// Measured on Inkling 2 Mini Q4_K_M with its Q8_0 drafter: 5193 verified tokens from 18 chat answers. The drafter
+// is overconfident below 0.98.
+static float inkling2_accept_rate(float conf) {
+    static constexpr struct { float below; float rate; } map[] = {
+        { 0.3f,  0.106f }, { 0.5f,  0.279f }, { 0.7f,   0.418f }, { 0.8f,   0.519f }, { 0.9f, 0.602f },
+        { 0.95f, 0.728f }, { 0.98f, 0.761f }, { 0.99f,  0.878f }, { 0.995f, 0.902f }, { 0.999f, 0.920f },
+    };
+    for (const auto & entry : map) {
+        if (conf < entry.below) {
+            return entry.rate;
+        }
+    }
+    return 0.978f;
+}
+
 struct common_speculative_impl_inkling2_dspark final : public common_speculative_impl_draft_dflash {
     std::vector<common_params_sampling> sampler_cfg;
     std::vector<std::mt19937> rng;
@@ -1542,8 +1558,8 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                 target_layer_ids[target_layer_ids_n - 1] != llama_model_n_layer(llama_get_model(params.ctx_tgt))) {
             throw std::runtime_error("invalid Inkling2 DSpark target or attention configuration");
         }
-        if (params.p_min > 0) {
-            throw std::runtime_error("Inkling2 DSpark has no confidence head: please set --spec-draft-p-min 0");
+        if (params.p_min > 0 && !params.backend_sampling) {
+            throw std::runtime_error("Inkling2 DSpark reports its confidence only with backend sampling: please set --spec-draft-p-min 0");
         }
         if (llama_n_ubatch(params.ctx_dft) < (uint32_t) block_size || llama_n_batch(params.ctx_dft) < (uint32_t) block_size) {
             throw std::runtime_error("Inkling2 DSpark requires a draft batch and ubatch of at least one block");
@@ -1620,13 +1636,21 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                 continue;
             }
             if (backend) {
-                const float * conf = dp.result_conf ? llama_get_embeddings_nextn(ctx) : nullptr;
+                const float * conf = dp.result_conf || params.p_min > 0 ? llama_get_embeddings_nextn(ctx) : nullptr;
+                // p_min cuts the draft where the chance that the target accepts the whole prefix falls below it
+                float p_prefix = 1.0f;
                 bool valid = true;
                 for (int i = 1; valid && i <= count; ++i) {
+                    if (params.p_min > 0) {
+                        p_prefix *= inkling2_accept_rate(conf[(size_t) i*width]);
+                        if (p_prefix < params.p_min) {
+                            break;
+                        }
+                    }
                     const auto id = llama_get_sampled_token_ith(ctx, i);
                     valid = id >= 0 && id < n_vocab;
                     dp.result->push_back(id);
-                    if (conf) {
+                    if (dp.result_conf) {
                         dp.result_conf->push_back(conf[(size_t) i*width]);
                     }
                     if (sample && valid) {
@@ -1647,6 +1671,8 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                 }
                 if (!valid) {
                     LOG_WRN("%s: invalid Inkling2 proposal block for sequence %d\n", __func__, seq_id);
+                }
+                if (!valid || (int) dp.result->size() < params.n_min) {
                     dp.result->clear();
                     if (dp.result_conf) {
                         dp.result_conf->clear();
@@ -1654,7 +1680,8 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                     if (dp.result_q) {
                         dp.result_q->clear();
                     }
-                } else if (sample) {
+                }
+                if (valid && sample) {
                     rng[seq_id] = next_rng;
                 }
                 continue;
