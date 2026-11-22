@@ -3481,7 +3481,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         // the legacy quants hold the experts whose rows do not fit K-quant blocks, such as Inkling 2's k = 1152
 #define CREATE_DMMV_ID_TOKENS(TYPE, NAME, ROWS) \
-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_tokens_f32[w][TYPE], "mul_mat_vec_id_tokens_" #NAME "_f32", arr_dmmv_id_tokens_##NAME##_f32_f32_len[reduc], arr_dmmv_id_tokens_##NAME##_f32_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {ROWS, 1, 1}, {wg_size_subgroup, ROWS}, 1, true, use_subgroups, force_subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_tokens_f32[w][TYPE][0], "mul_mat_vec_id_tokens_" #NAME "_f32", arr_dmmv_id_tokens_##NAME##_f32_f32_len[reduc], arr_dmmv_id_tokens_##NAME##_f32_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {ROWS, 1, 1}, {wg_size_subgroup, ROWS}, 1, true, use_subgroups, force_subgroup_size); \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_tokens_f32[w][TYPE][1], "mul_mat_vec_id_tokens_wide_" #NAME "_f32", arr_dmmv_id_tokens_##NAME##_f32_f32_len[reduc], arr_dmmv_id_tokens_##NAME##_f32_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*(ROWS), 1, 1}, {wg_size_subgroup, 2*(ROWS)}, 1, true, use_subgroups, force_subgroup_size);
         CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q2_0, q2_0, 2*rm_stdq);
         CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q4_0, q4_0, 2*rm_stdq);
         CREATE_DMMV_ID_TOKENS(GGML_TYPE_Q4_1, q4_1, 2*rm_stdq);
@@ -6389,7 +6390,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
 }
 
-static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t m, uint32_t k, bool all_tokens = false) {
+static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t m, uint32_t k, bool all_tokens = false, bool wide = false) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec_id()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_Q8_1);
 
@@ -6474,7 +6475,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         return all_tokens ? ctx->device->pipeline_dequant_mul_mat_vec_id_tokens_q8_1_f32[dmmv_wg][a_type] : ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[dmmv_wg][a_type];
     }
 
-    return all_tokens ? ctx->device->pipeline_dequant_mul_mat_vec_id_tokens_f32[dmmv_wg][a_type] : ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
+    return all_tokens ? ctx->device->pipeline_dequant_mul_mat_vec_id_tokens_f32[dmmv_wg][a_type][wide] : ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
 vk_subbuffer ggml_vk_tensor_subbuffer(
@@ -8921,8 +8922,9 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
-        // Fall back to f16 dequant mul mat, which has a variant for all tokens only for the legacy quants
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00, all_tokens);
+        // Fall back to f16 dequant mul mat, which has a variant for all tokens only for the legacy quants. From 4 tokens
+        // on there are enough workgroups to give each twice the rows; with 2 tokens the lost parallelism cost more.
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00, all_tokens, nei1 >= 4);
         quantize_y = false;
         if (dmmv == nullptr) {
             dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00);

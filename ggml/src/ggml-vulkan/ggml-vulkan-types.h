@@ -1019,7 +1019,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
-    vk_pipeline pipeline_dequant_mul_mat_vec_id_tokens_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    // the all-tokens F32 id mat-vec, and the same with twice the rows per workgroup for 4 or more tokens
+    vk_pipeline pipeline_dequant_mul_mat_vec_id_tokens_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][2];
     // the F32 mat-vec of DMMV_WG_SIZE_SUBGROUP with the SOFT_MAX of its src1, by number of columns
     vk_pipeline pipeline_mul_mat_vec_soft_max_f32[mul_mat_vec_max_cols];
     // the F32 mat-vec of two matrices and outputs with one src1, by workgroup size and number of columns
