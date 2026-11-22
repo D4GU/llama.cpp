@@ -206,6 +206,7 @@ llama_context::llama_context(
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     cparams.embeddings_layer_inp_dev = false;
     cparams.embeddings_nextn_dev     = false;
+    cparams.batch_invariant          = false;
     cparams.ctx_state_src            = nullptr;
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
@@ -510,6 +511,10 @@ llama_context::llama_context(
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                }
+                auto set_batch_invariant_fn = (ggml_backend_set_batch_invariant_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_batch_invariant");
+                if (set_batch_invariant_fn) {
+                    set_batch_invariant_fns.emplace_back(backend.get(), set_batch_invariant_fn);
                 }
             }
         }
@@ -1697,6 +1702,12 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_batch_invariant(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    cparams.batch_invariant = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1928,6 +1939,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    for (const auto & [backend, set_batch_invariant_fn] : set_batch_invariant_fns) {
+        set_batch_invariant_fn(backend, gparams.batch_invariant());
     }
 
     const auto status = graph_compute(gsched, res->get_gf(), ubatch.n_tokens > 1);
@@ -4821,6 +4836,10 @@ bool llama_supports_embd_row(const llama_context * ctx) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_batch_invariant(llama_context * ctx, bool value) {
+    ctx->set_batch_invariant(value);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

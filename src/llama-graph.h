@@ -564,6 +564,12 @@ public:
     std::vector<ggml_tensor *> self_k_rot_swa;
     std::vector<ggml_tensor *> self_v_rot_swa;
 
+    // in a batch-invariant ubatch, the leading rows that each attend over n_kv_lo cells, as a ubatch of their own does
+    uint32_t n_rows_lo     = 0;
+    uint32_t n_kv_lo       = 0;
+    uint32_t n_rows_lo_swa = 0;
+    uint32_t n_kv_lo_swa   = 0;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -891,6 +897,11 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // a ubatch of a few tokens that all output, computed per token as a ubatch of that token alone computes it
+    bool batch_invariant() const {
+        return cparams.batch_invariant && ubatch.n_tokens > 1 && ubatch.n_tokens <= 8 && n_outputs == ubatch.n_tokens;
+    }
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -960,6 +971,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.batch_invariant         == other.cparams.batch_invariant         &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
             h_nextn_dev   == other.h_nextn_dev   &&
@@ -1126,6 +1138,7 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const bool    batch_invariant; // see llm_graph_params::batch_invariant()
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

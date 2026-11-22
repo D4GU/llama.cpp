@@ -1193,6 +1193,10 @@ extern "C" {
     // Set whether the context outputs the input embeddings of a specific layer
     LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+    // Compute each token of a ubatch of 2 to 8 tokens that all output, such as a verification of speculative drafts,
+    // bit for bit as a ubatch of that token alone computes it. Only those ubatches change, and they run slower
+    LLAMA_API void llama_set_batch_invariant(struct llama_context * ctx, bool value);
+
     // Get the input embeddings of a specific layer, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 

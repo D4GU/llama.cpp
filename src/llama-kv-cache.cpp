@@ -1294,20 +1294,39 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
+// pad the n_kv value so that the graph remains constant across batches and can be reused
+// note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+static uint32_t llama_kv_padded_n_kv(const llama_kv_cells & cells, uint32_t used_max_p1) {
+    const uint32_t n_pad = 256;
+
+    return std::min(cells.size(), std::max(n_pad, GGML_PAD(used_max_p1, n_pad)));
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
-    // pad the n_kv value so that the graph remains constant across batches and can be reused
-    // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad = 256;
-
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const auto & cells = v_cells[sinfo.strm[s]];
-
-        result = std::max(std::min(cells.size(), std::max(n_pad, GGML_PAD(cells.used_max_p1(), n_pad))), result);
+        result = std::max(llama_kv_padded_n_kv(v_cells[sinfo.strm[s]], v_cells[sinfo.strm[s]].used_max_p1()), result);
     }
 
     return result;
+}
+
+uint32_t llama_kv_cache::get_n_kv_alone(const slot_info & sinfo, uint32_t i) const {
+    GGML_ASSERT(sinfo.n_stream() == 1);
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+    const auto & idxs  = sinfo.idxs[0];
+
+    // the cells of the tokens after i are not in use yet when token i is decoded alone
+    uint32_t used_max_p1 = 0;
+    for (uint32_t c = cells.used_max_p1(); c > 0 && used_max_p1 == 0; --c) {
+        if (!cells.is_empty(c - 1) && std::find(idxs.begin() + i + 1, idxs.end(), c - 1) == idxs.end()) {
+            used_max_p1 = c;
+        }
+    }
+
+    return llama_kv_padded_n_kv(cells, used_max_p1);
 }
 
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
@@ -3054,6 +3073,32 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
     return n_kv_rows;
+}
+
+uint32_t llama_kv_cache_context::get_n_rows_kv_lo(uint32_t & n_kv_lo) const {
+    n_kv_lo = n_kv;
+
+    const auto & sinfo = sinfos[i_cur];
+    if (sinfo.n_stream() != 1) {
+        return 0;
+    }
+
+    uint32_t n_rows = 0;
+    for (uint32_t i = 0; i < sinfo.size(); ++i) {
+        const uint32_t n = kv->get_n_kv_alone(sinfo, i);
+        if (n == (uint32_t) n_kv) {
+            break;
+        }
+        // the leading rows share one smaller n_kv, as a ubatch of a few tokens crosses at most one padding step
+        if (n_rows > 0 && n != n_kv_lo) {
+            n_kv_lo = n_kv;
+            return 0;
+        }
+        n_kv_lo = n;
+        n_rows++;
+    }
+
+    return n_rows;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

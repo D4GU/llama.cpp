@@ -139,6 +139,7 @@ struct llama_context {
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    void set_batch_invariant(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -468,6 +469,7 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+    std::vector<std::pair<ggml_backend_t, ggml_backend_set_batch_invariant_t>> set_batch_invariant_fns;
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

@@ -194,6 +194,9 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // the n_kv of a ubatch of token i of sinfo alone, decoded after the tokens before it
+    uint32_t get_n_kv_alone(const slot_info & sinfo, uint32_t i) const;
+
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
@@ -419,6 +422,10 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
+
+    // the number of leading tokens of the ubatch that, each decoded alone, attend over n_kv_lo < n_kv cells
+    // 0 if every token would attend over n_kv cells, or if the tokens would see more than one smaller n_kv
+    uint32_t get_n_rows_kv_lo(uint32_t & n_kv_lo) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

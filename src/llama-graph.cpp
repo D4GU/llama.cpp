@@ -1466,6 +1466,12 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 
+    if (params.batch_invariant()) {
+        uint32_t n_kv_lo = 0;
+        res &= inp_attn->n_rows_lo     == attn_ctx->get_base()->get_n_rows_kv_lo(n_kv_lo) && inp_attn->n_kv_lo     == n_kv_lo;
+        res &= inp_attn->n_rows_lo_swa == attn_ctx->get_swa()->get_n_rows_kv_lo(n_kv_lo)  && inp_attn->n_kv_lo_swa == n_kv_lo;
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
@@ -1707,6 +1713,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
+    batch_invariant  (params.batch_invariant()),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -3856,7 +3863,28 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    const int64_t n_rows_lo = is_swa ? inp->n_rows_lo_swa : inp->n_rows_lo;
+
+    ggml_tensor * cur;
+    if (n_rows_lo == 0) {
+        cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    } else {
+        // the leading rows attend over the first n_kv_lo cells, as each does in a ubatch of its own: the split of the
+        // cells in flash attention depends on their count. Only the dense mask with the bias folded in is split
+        GGML_ASSERT(cparams.flash_attn && !kq_b && !kv_rows && !v_mla && !use_kv_cur && k->ne[3] == 1);
+        const int64_t n_kv_lo  = is_swa ? inp->n_kv_lo_swa : inp->n_kv_lo;
+        const int64_t n_tokens = q->ne[2];
+
+        auto attend = [&](int64_t r0, int64_t n_rows, int64_t n_kv) {
+            ggml_tensor * q_rows = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n_rows, q->nb[1], q->nb[2], r0*q->nb[2]);
+            ggml_tensor * k_kv   = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], n_kv, k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+            ggml_tensor * v_kv   = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], n_kv, v->ne[3], v->nb[1], v->nb[2], v->nb[3], 0);
+            ggml_tensor * mask   = ggml_cont(ctx0, ggml_view_4d(ctx0, kq_mask, n_kv, n_rows, kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], r0*kq_mask->nb[1]));
+            return gctx.build_attn_mha(q_rows, k_kv, v_kv, nullptr, mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+        };
+        cur = ggml_concat(ctx0, attend(0, n_rows_lo, n_kv_lo), attend(n_rows_lo, n_tokens - n_rows_lo, k->ne[2]), 1);
+    }
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -4475,6 +4503,11 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     inp_attn->self_k_rot_swa = attn_ctx->get_swa()->get_k_rot();
     inp_attn->self_v_rot_swa = attn_ctx->get_swa()->get_v_rot();
+
+    if (batch_invariant) {
+        inp_attn->n_rows_lo     = attn_ctx->get_base()->get_n_rows_kv_lo(inp_attn->n_kv_lo);
+        inp_attn->n_rows_lo_swa = attn_ctx->get_swa()->get_n_rows_kv_lo(inp_attn->n_kv_lo_swa);
+    }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 

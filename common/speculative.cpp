@@ -3626,6 +3626,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         return nullptr;
     }
 
+    // the target then computes each token of a verification as plain decoding computes it
+    if (params.draft.ctx_tgt) {
+        llama_set_batch_invariant(params.draft.ctx_tgt, true);
+    }
+
     // the n-gram drafters ignore p_min, and DSpark uses it as the cutoff of its confidence head
     const bool uses_p_min = std::any_of(impls.begin(), impls.end(), [](const auto & impl) {
         switch (impl->type) {

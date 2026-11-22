@@ -286,6 +286,11 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     } else if (n_query*n_set == 1) {
         scores = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, states, n_embd, states->ne[1]*n_tokens), query);
         scores = ggml_reshape_3d(ctx0, scores, states->ne[1], 1, n_tokens);
+    } else if (batch_invariant) {
+        // the queries of each token as a batch of single columns, which the mat-vec of a single token sums alike,
+        // where the matrix product of several queries over several tokens sums differently
+        ggml_tensor * queries = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_query*n_set*n_tokens);
+        scores = ggml_mul_mat(ctx0, states, ggml_repeat(ctx0, ggml_reshape_3d(ctx0, query, n_embd, 1, n_query*n_set), queries));
     } else {
         scores = ggml_mul_mat(ctx0, states, ggml_repeat(ctx0, query, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd, n_query, n_tokens, n_set)));
     }
@@ -294,6 +299,11 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     out = ggml_mul_mat(ctx0, states_t, scores);
     if (n_tokens == 1) {
         return out = n_set > 1 ? ggml_reshape_4d(ctx0, out, n_embd, n_query, n_tokens, n_set) : out;
+    }
+    if (batch_invariant && n_query*n_set > 1) {
+        // [n_embd, n_query, n_set, n_tokens] to [n_embd, n_tokens, n_query, n_set]
+        out = ggml_reshape_4d(ctx0, out, n_embd, n_query, n_set, n_tokens);
+        return out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 3, 1));
     }
     // one copy here instead of one for each query that a caller reads
     return out = n_query*n_set > 1 ? ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)) : out;
