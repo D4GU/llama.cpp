@@ -447,15 +447,6 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_build_forward_expand(g.gf, out);
 }
 
-static ggml_tensor * inkling2_argmax(ggml_context * ctx, ggml_tensor * logits) {
-    // The host sampler takes the lowest ID on ties. Backend argmax tie rules differ.
-    const int64_t n = logits->ne[0];
-    auto * peak = ggml_get_rows(ctx, ggml_reshape_2d(ctx, logits, 1, n), ggml_argmax(ctx, logits));
-    auto * below = ggml_step(ctx, ggml_sub(ctx, ggml_repeat(ctx, peak, logits), logits));
-    auto * rank = ggml_scale_bias(ctx, ggml_arange(ctx, 0, n, 1), -1, n);
-    return ggml_argmax(ctx, ggml_sub(ctx, rank, ggml_scale(ctx, below, n)));
-}
-
 // Integer prefix sums stay exact regardless of the backend scan order.
 static ggml_tensor * inkling2_draw(ggml_context * ctx, ggml_tensor * logits, ggml_tensor * temperature,
         ggml_tensor * ticket, ggml_tensor * & q) {
@@ -549,7 +540,8 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
             ggml_build_forward_expand(gf, q);
             top = ggml_argmax(ctx0, logits);
         } else {
-            prev = inkling2_argmax(ctx0, logits);
+            // a draft only proposes, so exact ties may break differently than the host sampler's lowest ID
+            prev = ggml_argmax(ctx0, logits);
             top = prev;
         }
         cb(prev, "dspark_token", i);
