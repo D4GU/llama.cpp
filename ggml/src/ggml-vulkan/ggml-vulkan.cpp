@@ -17224,31 +17224,54 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
     };
 
-    auto const &is_src_of = [&is_empty](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
-        auto const &base = [](const ggml_tensor * tensor) {
-            return tensor->view_src ? tensor->view_src : tensor;
-        };
+    auto const &base = [](const ggml_tensor * tensor) {
+        return tensor->view_src ? tensor->view_src : tensor;
+    };
+
+    // the checks below read the ops and sources of the nodes in a window many times per node, flat copies of them
+    // save a pointer chase per read
+    struct node_deps {
+        const ggml_tensor * base;
+        bool                empty;
+        const ggml_tensor * src[GGML_MAX_SRC];
+        const ggml_tensor * src_base[GGML_MAX_SRC];
+    };
+    std::vector<ggml_op>   node_ops(graph->n_nodes);
+    std::vector<node_deps> deps(graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        node_ops[i]   = node->op;
+        deps[i].base  = base(node);
+        deps[i].empty = is_empty(node);
         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
-            if (dst->src[s] == src) {
+            deps[i].src[s]      = node->src[s];
+            deps[i].src_base[s] = node->src[s] ? base(node->src[s]) : nullptr;
+        }
+    }
+
+    // whether node dst depends on node src
+    auto const &is_src_of = [&](int dst, int src) -> bool {
+        const node_deps & d = deps[dst];
+        const node_deps & s = deps[src];
+        for (uint32_t k = 0; k < GGML_MAX_SRC; ++k) {
+            if (d.src[k] == graph->nodes[src]) {
                 return true;
             }
-            if (is_empty(dst) || is_empty(src)) {
-                continue;
-            }
-            // A source view of dst may read storage written through a different view by src.
-            if (dst->src[s] && base(dst->src[s]) == base(src)) {
-                return true;
-            }
-            // Moving dst forward may overwrite storage still read through a view by src.
-            if (src->src[s] && base(dst) == base(src->src[s])) {
-                return true;
+        }
+        if (!d.empty && !s.empty) {
+            for (uint32_t k = 0; k < GGML_MAX_SRC; ++k) {
+                // A source view of dst may read storage written through a different view by src.
+                if (d.src[k] && d.src_base[k] == s.base) {
+                    return true;
+                }
+                // Moving dst forward may overwrite storage still read through a view by src.
+                if (s.src[k] && d.base == s.src_base[k]) {
+                    return true;
+                }
             }
         }
         // implicit dependency if they view the same tensor
-        if (base(dst) == base(src)) {
-            return true;
-        }
-        return false;
+        return d.base == s.base;
     };
 
     std::vector<ggml_tensor *> new_order;
@@ -17260,7 +17283,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     // scheduled or zero-compute nodes in [lo, hi)
     auto const &empty_or_scheduled_between = [&](int lo, int hi) -> bool {
         for (int v = lo; v < hi; ++v) {
-            if (!used[v] && !is_empty(graph->nodes[v])) {
+            if (!used[v] && !deps[v].empty) {
                 return false;
             }
         }
@@ -17285,22 +17308,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
         // Check for fusion patterns and avoid reordering them
         auto const &match_pattern = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
-            if (start + (int)pattern.size() <= graph->n_nodes) {
-                bool is_pattern = true;
-                for (size_t j = 0; j < pattern.size(); ++j) {
-                    if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
-                        is_pattern = false;
-                    }
-                }
-                return is_pattern;
+            if (start + (int)pattern.size() > graph->n_nodes) {
+                return false;
             }
-            return false;
+            for (size_t j = 0; j < pattern.size(); ++j) {
+                if (node_ops[start + j] != pattern.begin()[j] || used[start + j]) {
+                    return false;
+                }
+            }
+            return true;
         };
 
         // whether node n is any node of an unscheduled instance of pattern
         auto const &in_pattern = [&](const std::initializer_list<ggml_op> &pattern, int n) -> bool {
             for (int o = 0; o < (int) pattern.size(); ++o) {
-                if (n - o >= 0 && graph->nodes[n]->op == pattern.begin()[o] && match_pattern(pattern, n - o)) {
+                if (n - o >= 0 && node_ops[n] == pattern.begin()[o] && match_pattern(pattern, n - o)) {
                     return true;
                 }
             }
@@ -17362,8 +17384,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             bool can_pull = ggml_can_fuse_subgraph_ext(graph, node_idxs, 3, ops, &set_rows_idx, 1);
 
             for (int c = idx + 1; can_pull && c < set_rows_idx; ++c) {
-                if (!used[c] && c != view_idx && !is_empty(graph->nodes[c]) &&
-                    is_src_of(graph->nodes[set_rows_idx], graph->nodes[c])) {
+                if (!used[c] && c != view_idx && !deps[c].empty &&
+                    is_src_of(set_rows_idx, c)) {
                     can_pull = false;
                 }
             }
@@ -17497,7 +17519,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             if (used[j]) {
                 continue;
             }
-            if (is_empty(graph->nodes[j])) {
+            if (deps[j].empty) {
                 continue;
             }
             // Protect every interior QSA and loop controller node (not just the start): the mask
@@ -17531,7 +17553,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             bool ok = true;
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] &&
-                    is_src_of(graph->nodes[j], graph->nodes[c]) &&
+                    is_src_of(j, c) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
@@ -17646,7 +17668,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (used[j]) {
                     continue;
                 }
-                if (!is_empty(graph->nodes[j])) {
+                if (!deps[j].empty) {
                     continue;
                 }
                 // keep_pattern needs both SITU views in place. The first pass never moves SITU nodes:
@@ -17659,7 +17681,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     bool c_in_current_set = std::find(current_set.begin(), current_set.end(), c) != current_set.end();
                     // skip views whose srcs haven't been processed.
                     if (!used[c] &&
-                        is_src_of(graph->nodes[j], graph->nodes[c]) &&
+                        is_src_of(j, c) &&
                         !c_in_current_set) {
                         ok = false;
                         break;
