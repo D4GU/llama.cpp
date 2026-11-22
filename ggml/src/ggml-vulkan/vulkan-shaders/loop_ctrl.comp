@@ -21,6 +21,7 @@ layout (push_constant) uniform parameter {
     uint ne;
     uint f_offset, g_offset, x_offset, m_offset, d_offset;
     uint rms_partials;
+    uint row_len; // nonzero: the z workgroup is the row, and each row writes partial sums as a row of its own
 } p;
 
 shared float sumsh[num_threads];
@@ -32,7 +33,14 @@ float op_tanh(float x) {
 
 void main() {
     uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
-    const uint orig_idx = idx;
+    uint end = p.ne;
+    uint partial = idx / 512;
+    if (p.row_len != 0) {
+        const uint col = gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+        idx     = gl_WorkGroupID.z * p.row_len + col;
+        end     = (gl_WorkGroupID.z + 1) * p.row_len;
+        partial = gl_WorkGroupID.z * ((p.row_len + 511) / 512) + col / 512;
+    }
 
     // laid out as add.comp, so the partial sums add in the same order
     const uint num_iter = 2;
@@ -40,7 +48,7 @@ void main() {
     float sum_sq = 0;
 
     [[unroll]] for (uint i = 0; i < num_iter; ++i) {
-        if (idx >= p.ne) {
+        if (idx >= end) {
             continue;
         }
 
@@ -73,7 +81,7 @@ void main() {
         }
 
         if (gl_SubgroupID == 0 && gl_SubgroupInvocationID == 0) {
-            partial_sums[orig_idx / (num_iter * num_threads)] = sum_sq;
+            partial_sums[partial] = sum_sq;
         }
     }
 }

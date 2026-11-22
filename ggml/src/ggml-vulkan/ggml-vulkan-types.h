@@ -1493,6 +1493,9 @@ struct ggml_backend_vk_context {
     bool do_add_rms_partials_offset_calculation;
     bool do_add_rms_partials;
 
+    // the mat-vec quantization and the attention KV split are chosen as for one row, see ggml_backend_set_batch_invariant_t
+    bool batch_invariant {};
+
     uint64_t last_total_flops {UINT64_MAX};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.

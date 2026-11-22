@@ -766,6 +766,7 @@ struct vk_op_loop_ctrl_push_constants {
     uint32_t ne;
     uint32_t f_offset, g_offset, x_offset, m_offset, d_offset;
     uint32_t rms_partials;
+    uint32_t row_len;
 };
 
 struct vk_op_attn_rel_bias_push_constants {

@@ -7641,7 +7641,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     const ggml_type y_kernel_type = widen_bf16 ? GGML_TYPE_F32 : src1->type;
     const bool f16_f32_kernel = y_kernel_type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_signed && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && (swap_inputs || ggml_vk_src1_prec_allows_q8(dst)) && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+    bool quantize_y = ctx->device->integer_dot_signed && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && (swap_inputs || ggml_vk_src1_prec_allows_q8(dst)) && ggml_vk_should_use_mmvq(ctx->device, ne01, ctx->batch_invariant ? 1 : ne11, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -8885,7 +8885,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_signed && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    bool quantize_y = ctx->device->integer_dot_signed && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, ne01, ctx->batch_invariant ? 1 : ne12, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -9355,7 +9355,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
+    // without grouped heads the tile shape follows the row count, so a batch-invariant graph takes the one-row tiles
+    const uint32_t tune_rows = ctx->batch_invariant && gqa_ratio == 1 ? 1 : N;
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, tune_rows, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;
@@ -9428,7 +9430,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const bool kv_16b = use_dequant_kv ||
             (((uintptr_t)k->data | (uintptr_t)v->data | nbk2_eff | nbk3_eff | nbv2_eff | nbv3_eff) % 16) == 0;
         if (!aligned || use_sparse || gqa_ratio != 1 || !kv_16b) {
-            tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, false);
+            tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, tune_rows, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, false);
             alignment = tuning_params.block_cols;
             aligned = fa_aligned(tuning_params);
         }
@@ -9570,10 +9572,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // Match the shader's per-split block count so no split is empty.
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
-    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+    } else if (gqa_ratio > 1 && (ctx->batch_invariant || workgroups_x <= Br)) {
+        // a workgroup holds the heads of one row, so splitting as for one row makes each row's sums independent of the row count
+        split_k = shader_core_count * 2 / ((ctx->batch_invariant ? 1 : workgroups_x) * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
-        uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
+        uint32_t total_wgs_no_split = (ctx->batch_invariant ? 1 : Tr) * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
             split_k = shader_core_count * 2 / total_wgs_no_split;
         }
@@ -10670,6 +10673,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     GGML_UNUSED(src2);
 }
 
+// The budget counts the partial sums of one row per fusion, so a batch-invariant graph fuses the same RMS_NORMs as a
+// graph of one row. Each fusion has room for the rows of such a graph
+static constexpr uint32_t vk_rms_partials_max_rows = 8;
+
+static size_t ggml_vk_rms_partials_offset(const ggml_backend_vk_context * ctx) {
+    return (size_t)ctx->prealloc_size_add_rms_partials_offset * vk_rms_partials_max_rows;
+}
+
 template<typename PC>
 static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc, vk_pipeline pipeline_override = nullptr) {
     VK_LOG_DEBUG("ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -10766,8 +10777,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_RMS_NORM:
         if (ctx->do_add_rms_partials) {
-            // Run one element per thread, 128 threads per workgroup
-            elements = { (uint32_t)CEIL_DIV(ne00, 128), 1, 1 };
+            // Run one element per thread, 128 threads per workgroup, a row of workgroups per row
+            elements = { (uint32_t)CEIL_DIV(ne00, 128), (uint32_t)ne01, 1 };
         } else {
             elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
             elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
@@ -11074,7 +11085,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     if (op == GGML_OP_ADD || op == GGML_OP_RMS_NORM) {
         vk_subbuffer a_buf = src0_buf;
         if (ctx->do_add_rms_partials) {
-            a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
+            a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ggml_vk_rms_partials_offset(ctx));
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { src0_buf, src1_buf, dst_buf, a_buf }, pc, elements);
@@ -11243,7 +11254,7 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
     }
     if (ctx->do_add_rms_partials) {
         buf[num_tensors] = ctx->prealloc_add_rms_partials;
-        offset[num_tensors] = ctx->prealloc_size_add_rms_partials_offset;
+        offset[num_tensors] = ggml_vk_rms_partials_offset(ctx);
     }
 
     std::array<uint32_t, 3> elements;
@@ -12298,10 +12309,10 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                     ggml_vk_tensor_subbuffer(ctx, src0, true),
                     ggml_vk_tensor_subbuffer(ctx, weight, true),
                     ggml_vk_tensor_subbuffer(ctx, dst, true),
-                    ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset),
+                    ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ggml_vk_rms_partials_offset(ctx)),
                     ggml_vk_tensor_subbuffer(ctx, residual),
                     ggml_vk_tensor_subbuffer(ctx, post_scale),
-                }, pc, { (uint32_t)CEIL_DIV(src0->ne[0], 128), 1, 1 });
+                }, pc, { (uint32_t)CEIL_DIV(src0->ne[0], 128), (uint32_t)src0->ne[1], 1 });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                 {
@@ -13526,22 +13537,26 @@ static void ggml_vk_loop_ctrl(ggml_backend_vk_context * ctx, vk_context& subctx,
 
     const uint32_t ne = (uint32_t)ggml_nelements(dst);
     const uint32_t fs = sizeof(float);
+    // several rows with partial sums: one z workgroup per row, so each row sums its squares as a row alone does
+    const uint32_t nrows = (uint32_t)ggml_nrows(dst);
+    const bool row_partials = ctx->do_add_rms_partials && nrows > 1;
     const vk_op_loop_ctrl_push_constants pc = {
         ne,
         get_misalign_bytes(ctx, f) / fs, get_misalign_bytes(ctx, g) / fs, get_misalign_bytes(ctx, x) / fs,
         get_misalign_bytes(ctx, m) / fs, get_misalign_bytes(ctx, dst) / fs,
         ctx->do_add_rms_partials,
+        row_partials ? (uint32_t)dst->ne[0] : 0u,
     };
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
     // without partials the shader never touches binding 5, dst only fills it
     vk_subbuffer partials_buf = ctx->do_add_rms_partials ?
-        ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset) : dst_buf;
+        ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ggml_vk_rms_partials_offset(ctx)) : dst_buf;
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
         ggml_vk_tensor_subbuffer(ctx, f, true), ggml_vk_tensor_subbuffer(ctx, g, true), ggml_vk_tensor_subbuffer(ctx, x, true),
         ggml_vk_tensor_subbuffer(ctx, m, true), dst_buf, partials_buf,
-    }, pc, ggml_vk_nrows_elements(ne));
+    }, pc, row_partials ? std::array<uint32_t, 3>{ 512, CEIL_DIV((uint32_t)dst->ne[0], 512), nrows } : ggml_vk_nrows_elements(ne));
 }
 
 // node_idx is the SUB, the start of attn_rel_bias_pattern
@@ -13866,13 +13881,13 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
     }
-    if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
+    if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials * vk_rms_partials_max_rows)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
         // Resize buffer
         if (ctx->prealloc_add_rms_partials != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
-        ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
+        ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials * vk_rms_partials_max_rows);
     }
 }
 
@@ -13904,7 +13919,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             cgraph->nodes[next_node_idx]->src[0] == cgraph->nodes[next_node_idx - 1] &&
             cgraph->nodes[next_node_idx]->type == GGML_TYPE_F32 &&
             node->type == GGML_TYPE_F32 &&
-            ggml_nrows(cgraph->nodes[next_node_idx]) == 1 &&
+            (ggml_nrows(cgraph->nodes[next_node_idx]) == 1 ||
+             (ctx->batch_invariant && ctx->fused_loop_ctrl && ggml_nrows(cgraph->nodes[next_node_idx]) <= 8)) &&
             ctx->device->add_rms_fusion && !ctx->device->disable_fusion) {
             uint32_t size = ggml_vk_rms_partials_size(ctx, cgraph->nodes[node_idx]);
             ctx->do_add_rms_partials_offset_calculation = true;
@@ -16630,7 +16646,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_preallocate_buffers(ctx, nullptr);
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         // initialize partial sums to zero.
-        ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
+        ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials * vk_rms_partials_max_rows);
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
@@ -17815,6 +17831,11 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
 }
 
+static void ggml_backend_vk_set_batch_invariant(ggml_backend_t backend, bool batch_invariant) {
+    GGML_ASSERT(ggml_backend_is_vk(backend));
+    ((ggml_backend_vk_context *) backend->context)->batch_invariant = batch_invariant;
+}
+
 int ggml_backend_vk_get_device_count() {
     return ggml_vk_get_device_count();
 }
@@ -18832,6 +18853,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
 #endif
     if (strcmp(name, "ggml_backend_fusion_get") == 0) {
         return (void *) ggml_backend_vk_fusion_get;
+    }
+    if (strcmp(name, "ggml_backend_set_batch_invariant") == 0) {
+        return (void *) ggml_backend_vk_set_batch_invariant;
     }
     if (strcmp(name, "ggml_backend_fusion_stats_init") == 0) {
         return (void *) ggml_backend_vk_fusion_stats_init;

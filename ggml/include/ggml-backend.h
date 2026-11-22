@@ -230,6 +230,8 @@ extern "C" {
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
+    // Compute every row of the next graphs as the backend computes that row in a graph of one row
+    typedef void                         (*ggml_backend_set_batch_invariant_t)(ggml_backend_t backend, bool batch_invariant);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
