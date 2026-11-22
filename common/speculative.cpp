@@ -1637,13 +1637,14 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
             }
             if (backend) {
                 const float * conf = dp.result_conf || params.p_min > 0 ? llama_get_embeddings_nextn(ctx) : nullptr;
-                // p_min cuts the draft where the chance that the target accepts the whole prefix falls below it
+                // p_min cuts the draft where the chance that the target accepts the whole prefix falls below it, but
+                // never below n_min tokens
                 float p_prefix = 1.0f;
                 bool valid = true;
                 for (int i = 1; valid && i <= count; ++i) {
                     if (params.p_min > 0) {
                         p_prefix *= inkling2_accept_rate(conf[(size_t) i*width]);
-                        if (p_prefix < params.p_min) {
+                        if (p_prefix < params.p_min && i > params.n_min) {
                             break;
                         }
                     }
@@ -1671,8 +1672,6 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                 }
                 if (!valid) {
                     LOG_WRN("%s: invalid Inkling2 proposal block for sequence %d\n", __func__, seq_id);
-                }
-                if (!valid || (int) dp.result->size() < params.n_min) {
                     dp.result->clear();
                     if (dp.result_conf) {
                         dp.result_conf->clear();
@@ -1680,8 +1679,7 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
                     if (dp.result_q) {
                         dp.result_q->clear();
                     }
-                }
-                if (valid && sample) {
+                } else if (sample) {
                     rng[seq_id] = next_rng;
                 }
                 continue;
