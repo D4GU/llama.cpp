@@ -1842,6 +1842,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        const auto t0_us = ggml_time_us();
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1850,6 +1851,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        const auto t1_us = ggml_time_us();
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1866,6 +1868,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        if (getenv("LLAMA_REBUILD_TRACE")) {
+            fprintf(stderr, "REBUILD ctx=%p n_tokens=%u nodes=%d build_ms=%.3f alloc_ms=%.3f\n", (void *) this, ubatch.n_tokens,
+                    ggml_graph_n_nodes(gf), (t1_us - t0_us)/1000.0, (ggml_time_us() - t1_us)/1000.0);
+        }
     }
 
     // set the input data for the input tensors
