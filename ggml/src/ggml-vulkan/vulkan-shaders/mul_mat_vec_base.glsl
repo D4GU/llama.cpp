@@ -53,11 +53,29 @@ layout (push_constant) uniform parameter
 #ifdef MUL_MAT_ID
 uint expert_id;
 bool expert_skip; // an id of -1 skips the slot, the result row is zeroed
+#ifdef MUL_MAT_ID_TOKENS
+// All tokens in one dispatch: x is the row block within a group of gl_NumWorkGroups.x blocks, y the token, and z the
+// slot plus nei0 times the row group. The (slot, token) pairs of a row group run next to each other, so the tokens
+// that selected the same expert read those rows close together in time and all but the first find them in cache.
+#define ID_SLOT (gl_WorkGroupID.z % p.nei0)
+#define ID_SLOT_INVOCATION ID_SLOT
+#define ID_TOKEN gl_WorkGroupID.y
+#define ROW_GROUP (gl_WorkGroupID.z / p.nei0)
+#else
+// one dispatch per token; the two slot spellings keep the source, and so the SPIR-V, of these variants as it was
+#define ID_SLOT gl_WorkGroupID.y
+#define ID_SLOT_INVOCATION gl_GlobalInvocationID.y
+#define ID_TOKEN p.expert_i1
+#endif
+#endif
+
+#ifndef ROW_GROUP
+#define ROW_GROUP gl_WorkGroupID.z
 #endif
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
-    const uint expert_i0 = gl_WorkGroupID.y;
+    const uint expert_i0 = ID_SLOT;
 #else
     const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
 #endif
@@ -74,7 +92,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
         batch_idx_a = i03 * p.ne02 + i02;
     }
 #else
-    const int expert = data_ids[expert_i0 + p.expert_i1 * p.nbi1];
+    const int expert = data_ids[expert_i0 + ID_TOKEN * p.nbi1];
     expert_skip = expert == -1;
     expert_id   = expert_skip ? 0 : uint(expert); // clamp, so that the offsets below stay in range
 #endif
@@ -89,7 +107,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
     b_offset =
 #ifdef MUL_MAT_ID
-            (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+            (expert_i0 % p.ne11) * p.stride_b + ID_TOKEN * p.batch_stride_b;
 #elif defined(PAIR)
             0;
 #else
@@ -97,7 +115,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
     d_offset =
 #ifdef MUL_MAT_ID
-            expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+            expert_i0 * p.stride_d + ID_TOKEN * p.batch_stride_d;
 #elif defined(PAIR)
             batch_idx * p.pair_stride_d;
 #else
@@ -125,12 +143,12 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0 + p.expert_i1 * p.nei0]);
+                    const uint expert_i0 = ID_SLOT_INVOCATION;
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0 + ID_TOKEN * p.nei0]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0 + p.expert_i1 * p.nei0]);
+                    const uint expert_i0 = ID_SLOT_INVOCATION;
+                    temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0 + ID_TOKEN * p.nei0]);
                 }
                 if (expert_skip) {
                     temp[j][n] = FLOAT_TYPE(0);
@@ -183,12 +201,12 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0 + p.expert_i1 * p.nei0]);
+                    const uint expert_i0 = ID_SLOT_INVOCATION;
+                    temp[j][n] *= FLOAT_TYPE(data_fuse0[expert_i0 + ID_TOKEN * p.nei0]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0 + p.expert_i1 * p.nei0]);
+                    const uint expert_i0 = ID_SLOT_INVOCATION;
+                    temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0 + ID_TOKEN * p.nei0]);
                 }
                 if (expert_skip) {
                     temp[j][n] = FLOAT_TYPE(0);
@@ -231,12 +249,12 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[expert_i0 + p.expert_i1 * p.nei0]);
+                    const uint expert_i0 = ID_SLOT_INVOCATION;
+                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse0[expert_i0 + ID_TOKEN * p.nei0]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
-                    const uint expert_i0 = gl_GlobalInvocationID.y;
-                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse1[expert_i0 + p.expert_i1 * p.nei0]);
+                    const uint expert_i0 = ID_SLOT_INVOCATION;
+                    tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse1[expert_i0 + ID_TOKEN * p.nei0]);
                 }
                 if (expert_skip) {
                     tmpsh[j][n][0] = FLOAT_TYPE(0);
